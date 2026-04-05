@@ -74,7 +74,7 @@ def flux_clip(dtype_t5=None, t5_quantization_metadata=None):
 
 def load_mistral_tokenizer(data):
     if torch.is_tensor(data):
-        data = data.numpy().tobytes()
+        data = data.cpu().numpy().tobytes()
 
     try:
         from transformers.integrations.mistral import MistralConverter

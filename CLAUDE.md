@@ -92,3 +92,4 @@ See `dev-docs/dgx-spark-comfyui-loader-plan.md` for the original analysis and `d
 - Weight assignment behavior is controlled by `ModelPatcher.should_assign_weights()` — do not check `UNIFIED_MEMORY` directly at load_state_dict call sites.
 - Pyright reports many pre-existing errors (missing imports for torch, numpy, etc.) due to venv resolution. These are not real issues.
 - The `--unified-memory` flag is auto-detected on GB10 (sm_121) hardware via `is_unified_memory_system()` in `comfy/model_management.py`.
+- Unified memory gotcha: `safe_open(device="cuda")` loads ALL tensors to CUDA, including non-weight metadata (e.g., tokenizer vocab). Any code calling `.numpy()` on such tensors must add `.cpu()` first — e.g., `tensor.cpu().numpy()`. On unified memory `.cpu()` is essentially free.
