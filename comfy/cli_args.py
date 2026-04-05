@@ -172,6 +172,7 @@ parser.add_argument("--disable-pinned-memory", action="store_true", help="Disabl
 
 parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap when loading ckpt/pt files.")
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors.")
+parser.add_argument("--unified-memory", action="store_true", help="Enable unified memory optimizations for systems where CPU and GPU share memory (e.g., NVIDIA DGX Spark).")
 
 parser.add_argument("--dont-print-server", action="store_true", help="Don't print server output.")
 parser.add_argument("--quick-test-for-ci", action="store_true", help="Quick test for CI.")

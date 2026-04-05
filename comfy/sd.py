@@ -392,9 +392,9 @@ class CLIP:
 
     def load_sd(self, sd, full_model=False):
         if full_model:
-            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
         else:
-            can_assign = self.patcher.is_dynamic()
+            can_assign = self.patcher.should_assign_weights()
             self.cond_stage_model.can_assign_sd = can_assign
 
             # The CLIP models are a pretty complex web of wrappers and its
@@ -821,7 +821,7 @@ class VAE:
             mp = comfy.model_patcher.ModelPatcher
         self.patcher = mp(self.first_stage_model, load_device=self.device, offload_device=offload_device)
 
-        m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
 
@@ -1662,7 +1662,7 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         model = model_config.get_model(sd, diffusion_model_prefix, device=inital_load_device)
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device())
-        model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.is_dynamic())
+        model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.should_assign_weights())
 
     if output_vae:
         vae_sd = comfy.utils.state_dict_prefix_replace(sd, {k: "" for k in model_config.vae_key_prefix}, filter_keys=True)
@@ -1801,9 +1801,9 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     model = model_config.get_model(new_sd, "")
     ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
     model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-    if not model_management.is_device_cpu(offload_device):
+    if not model_management.UNIFIED_MEMORY and not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
-    model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
+    model.load_model_weights(new_sd, "", assign=model_patcher.should_assign_weights())
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))

@@ -291,6 +291,9 @@ class ModelPatcher:
     def is_dynamic(self):
         return False
 
+    def should_assign_weights(self):
+        return self.is_dynamic() or comfy.model_management.UNIFIED_MEMORY
+
     def model_size(self):
         if self.size > 0:
             return self.size

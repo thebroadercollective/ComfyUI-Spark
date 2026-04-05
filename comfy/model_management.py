@@ -320,6 +320,20 @@ def is_nvidia():
             return True
     return False
 
+def is_unified_memory_system():
+    global cpu_state
+    if cpu_state != CPUState.GPU:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if args.unified_memory:
+        return True
+    try:
+        props = torch.cuda.get_device_properties(0)
+        return props.major == 12 and props.minor == 1
+    except Exception:
+        return False
+
 def is_amd():
     global cpu_state
     if cpu_state == CPUState.GPU:
@@ -468,6 +482,10 @@ DISABLE_SMART_MEMORY = args.disable_smart_memory
 
 if DISABLE_SMART_MEMORY:
     logging.info("Disabling smart memory management")
+
+UNIFIED_MEMORY = is_unified_memory_system()
+if UNIFIED_MEMORY:
+    logging.info("Unified memory system detected, enabling optimizations")
 
 def get_torch_device_name(device):
     if hasattr(device, 'type'):
@@ -900,6 +918,10 @@ def unet_inital_load_device(parameters, dtype):
         return cpu_dev
 
     torch_dev = get_torch_device()
+
+    if UNIFIED_MEMORY:
+        return torch_dev
+
     if vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.SHARED:
         return torch_dev
 
