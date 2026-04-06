@@ -822,6 +822,11 @@ class VAE:
         self.patcher = mp(self.first_stage_model, load_device=self.device, offload_device=offload_device)
 
         m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
+        # When assign=True (unified memory), tensors from the checkpoint are assigned
+        # directly as parameters, preserving their original dtypes. If the checkpoint
+        # has mixed dtypes (e.g. weights in bf16, biases in fp32), normalize them.
+        if self.patcher.should_assign_weights():
+            self.first_stage_model.to(self.vae_dtype)
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
 
