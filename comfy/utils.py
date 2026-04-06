@@ -120,6 +120,7 @@ def load_safetensors(ckpt):
 
 
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+    explicit_device = device is not None
     if device is None:
         device = torch.device("cpu")
     metadata = None
@@ -132,9 +133,11 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                     metadata = None
             else:
                 unified = comfy.model_management.UNIFIED_MEMORY
-                load_device = "cuda" if unified else device.type
-                if unified:
+                if unified and not explicit_device:
+                    load_device = "cuda"
                     logging.debug("Unified memory: loading %s directly to CUDA", os.path.basename(ckpt))
+                else:
+                    load_device = device.type
 
                 with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
                     sd = {}

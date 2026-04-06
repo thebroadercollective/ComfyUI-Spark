@@ -15,6 +15,12 @@ uv run python main.py --listen 0.0.0.0 \
   --disable-mmap --dont-upcast-attention \
   --bf16-unet --bf16-vae --bf16-text-enc
 
+# Run with CPU text encoder loading (needed for large models like Flux2.dev)
+uv run python main.py --listen 0.0.0.0 \
+  --disable-dynamic-vram --reserve-vram 1 --disable-pinned-memory \
+  --disable-mmap --dont-upcast-attention \
+  --bf16-unet --bf16-vae --bf16-text-enc --cpu-text-enc
+
 # Lint
 uv run ruff check .
 
@@ -47,7 +53,7 @@ uv sync
 ### Core Model Pipeline (`comfy/`)
 The model loading and inference pipeline flows through these key files:
 
-- **`comfy/cli_args.py`** — All CLI flags parsed here. Memory-relevant flags: `--disable-mmap`, `--disable-pinned-memory`, `--disable-dynamic-vram`, `--reserve-vram`, `--bf16-unet/vae/text-enc`, `--highvram`, `--gpu-only`, `--lowvram`, `--novram`.
+- **`comfy/cli_args.py`** — All CLI flags parsed here. Memory-relevant flags: `--disable-mmap`, `--disable-pinned-memory`, `--disable-dynamic-vram`, `--reserve-vram`, `--bf16-unet/vae/text-enc`, `--cpu-text-enc`, `--highvram`, `--gpu-only`, `--lowvram`, `--novram`.
 - **`comfy/model_management.py`** (~1800 lines) — Central memory management. Controls VRAM state (HIGH/NORMAL/LOW/NO/SHARED), model loading/unloading between CPU and GPU, memory estimation, and the soft/hard memory limits that trigger offloading. The `VRAMState` enum and `load_models_gpu()` function are critical.
 - **`comfy/model_patcher.py`** (~1700 lines) — `ModelPatcher` wraps loaded models, handles weight patching (LoRA, etc.), device movement, and memory tracking. `patch_model()` / `unpatch_model()` manage weight modifications.
 - **`comfy/sd.py`** (~1850 lines) — High-level model loading. `load_diffusion_model()`, `load_clip()`, `load_vae()` orchestrate loading safetensors files into model architectures. Uses `comfy.utils.load_torch_file()` for the actual file I/O.
@@ -77,7 +83,7 @@ The model loading and inference pipeline flows through these key files:
 ### DGX Spark Unified Memory Context
 On the Spark, "CPU memory" and "GPU memory" are the same 128GB physical pool. The `--unified-memory` flag (auto-detected on GB10/sm_121) enables optimizations that eliminate two of three duplication layers:
 1. **mmap page cache** — `safetensors.safe_open()` uses mmap internally (at the Rust level). Page cache pages persist even after tensor materialization.
-2. **`copy=True` duplication** — ~~Eliminated~~. On unified memory, `load_torch_file()` loads directly to CUDA via `safe_open(device="cuda")`, skipping the copy.
+2. **`copy=True` duplication** — ~~Eliminated~~. On unified memory, `load_torch_file()` loads directly to CUDA via `safe_open(device="cuda")`, skipping the copy. **Important**: The CUDA override only applies when no explicit `device` is passed to `load_torch_file()` (`device=None` → use unified default). Passing an explicit `device=torch.device("cpu")` bypasses the CUDA override — this is how `--cpu-text-enc` and the DualCLIPLoader `device="cpu"` option work, avoiding CUDA allocator OOM when loading large multi-component models (e.g., Flux2.dev).
 3. **`load_state_dict(assign=False)` copy** — ~~Eliminated~~. `ModelPatcher.should_assign_weights()` returns `True` on unified memory, using `assign=True` to directly assign loaded tensors as model parameters.
 
 See `dev-docs/dgx-spark-comfyui-loader-plan.md` for the original analysis and `docs/superpowers/specs/2026-04-05-unified-memory-loading-design.md` for the implemented design.
@@ -93,3 +99,5 @@ See `dev-docs/dgx-spark-comfyui-loader-plan.md` for the original analysis and `d
 - Pyright reports many pre-existing errors (missing imports for torch, numpy, etc.) due to venv resolution. These are not real issues.
 - The `--unified-memory` flag is auto-detected on GB10 (sm_121) hardware via `is_unified_memory_system()` in `comfy/model_management.py`.
 - Unified memory gotcha: `safe_open(device="cuda")` loads ALL tensors to CUDA, including non-weight metadata (e.g., tokenizer vocab). Any code calling `.numpy()` on such tensors must add `.cpu()` first — e.g., `tensor.cpu().numpy()`. On unified memory `.cpu()` is essentially free.
+- `load_torch_file(device=None)` uses a sentinel pattern: `None` means "use default behavior (CUDA on unified memory)", an explicit device means "honor this device". Do not add boolean flags to override device — pass the device explicitly instead.
+- Text encoder device placement is controlled by `text_encoder_device()` in `model_management.py` — `load_clip()` passes this to `load_torch_file(device=...)`. The `--cpu-text-enc` flag and node-level `device="cpu"` both flow through this path.

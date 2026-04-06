@@ -1024,6 +1024,8 @@ def text_encoder_offload_device():
         return torch.device("cpu")
 
 def text_encoder_device():
+    if args.cpu_text_enc:
+        return torch.device("cpu")
     if args.gpu_only:
         return get_torch_device()
     elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM) or comfy.memory_management.aimdo_enabled:

@@ -1190,8 +1190,9 @@ def load_clip_model_patcher(ckpt_paths, embedding_directory=None, clip_type=CLIP
 
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
     clip_data = []
+    te_load_device = model_options.get("load_device", model_management.text_encoder_device())
     for p in ckpt_paths:
-        sd, metadata = comfy.utils.load_torch_file(p, safe_load=True, return_metadata=True)
+        sd, metadata = comfy.utils.load_torch_file(p, safe_load=True, return_metadata=True, device=te_load_device)
         if model_options.get("custom_operations", None) is None:
             sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
         clip_data.append(sd)
