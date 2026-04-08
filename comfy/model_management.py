@@ -907,6 +907,12 @@ def dtype_size(dtype):
     return dtype_size
 
 def unet_offload_device():
+    if UNIFIED_MEMORY:
+        # On unified memory, "offloading" to CPU would allocate a second copy
+        # of the weights in the same physical pool. Keep offload_device == load_device
+        # so ModelPatcher.unpatch_model / partially_unload become no-ops instead of
+        # duplicating model memory.
+        return get_torch_device()
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
     else:
@@ -1089,6 +1095,10 @@ def vae_device():
     return get_torch_device()
 
 def vae_offload_device():
+    if UNIFIED_MEMORY:
+        # See unet_offload_device(): avoid duplicating VAE weights into the same
+        # unified pool under the guise of "offloading".
+        return get_torch_device()
     if args.gpu_only:
         return get_torch_device()
     else:
