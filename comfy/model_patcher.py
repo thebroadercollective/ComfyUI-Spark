@@ -34,99 +34,70 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
 import comfy.weight_adapter
+from comfy.comfy_types import UnetWrapperFunction
+from comfy.quant_ops import QuantizedTensor
+from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
-# Backup entry for patch_weight_to_device.
-#   weight:         Original weight tensor to restore on unpatch (None for fast path).
-#   inplace_update: If True, restore via copy_to_param; else via set_attr_param.
-#   invertible:     If True, this is a fast-path marker - the patched weight was
-#                   mutated in place with an additive delta. Unpatch by recomputing
-#                   the delta from self.patches[key] and subtracting it in place.
-WeightBackup = collections.namedtuple('WeightBackup', ['weight', 'inplace_update', 'invertible'])
-WeightBackup.__new__.__defaults__ = (False,)  # invertible defaults to False for legacy paths
+import comfy_aimdo.model_vbar
 
 
-def _patches_are_invertible(patches):
-    """Return True iff every patch in the list is a purely additive constant delta.
+# weight=None + invertible=True marks the unified-memory fast path: the live
+# weight has been mutated in place and the original is recovered by recomputing
+# the additive delta from self.patches[key], not by reading bk.weight.
+WeightBackup = collections.namedtuple(
+    'WeightBackup', ['weight', 'inplace_update', 'invertible'], defaults=[False],
+)
 
-    Safe cases (can compute delta = calculate_weight(patches, zeros, key) and invert
-    via weight.add_(-delta)):
-      - patch_type == "diff" with pad_weight=False and matching shape
-      - WeightAdapterLoRA / LoHaAdapter / LoKrAdapter / GLoRAAdapter with dora_scale is None
-    Unsafe (fallback required):
-      - "set", "model_as_lora"
-      - OFT / BOFT / bypass adapters (non-additive or weight-dependent)
-      - Any DoRA variant (weight_decompose reads the live weight)
-      - offset (narrows the weight; delta-from-zero is wrong on the narrowed view)
-      - function != None (arbitrary transform on delta; still additive, but we can't
-        safely assert idempotency on zero base - conservatively reject)
-      - strength_model != 1.0 (scales the base weight, so the op is not purely additive)
-      - nested list patches (v is a list) - composed weights, reject
+
+def _patches_are_invertible(patches, weight_shape):
+    """True iff every patch is a purely additive constant delta of matching shape.
+
+    Rejects anything that reads the live weight (DoRA, set, model_as_lora,
+    OFT/BOFT, bypass), changes shape (offset, pad_weight, reshape), or applies
+    a transform (function, strength_model != 1.0) — those need the legacy copy
+    path for correctness.
     """
     for p in patches:
         v = p[1]
         strength_model = p[2]
         offset = p[3]
         function = p[4]
-        if strength_model != 1.0:
-            return False
-        if offset is not None:
-            return False
-        if function is not None:
+        if strength_model != 1.0 or offset is not None or function is not None:
             return False
         if isinstance(v, list):
             return False
         if isinstance(v, comfy.weight_adapter.WeightAdapterBase):
-            # Additive adapters without DoRA are invertible.
-            if isinstance(v, (comfy.weight_adapter.LoRAAdapter,
-                              comfy.weight_adapter.LoHaAdapter,
-                              comfy.weight_adapter.LoKrAdapter,
-                              comfy.weight_adapter.GLoRAAdapter)):
-                # dora_scale slot differs per adapter; fetch via .weights tuple.
-                w = v.weights
-                dora_slot = {
-                    comfy.weight_adapter.LoRAAdapter: 4,
-                    comfy.weight_adapter.LoHaAdapter: 7,
-                    comfy.weight_adapter.LoKrAdapter: 8,
-                    comfy.weight_adapter.GLoRAAdapter: 5,
-                }[type(v)]
-                if len(w) > dora_slot and w[dora_slot] is not None:
-                    return False
-                # LoRAAdapter also supports bypass flag in its base class; reshape
-                # (slot 5 for lora) would change weight shape - reject.
-                if isinstance(v, comfy.weight_adapter.LoRAAdapter):
-                    if len(w) > 5 and w[5] is not None:
-                        return False
-                continue
-            return False
-        # Raw tuple patches: determine patch_type.
+            if not isinstance(v, (comfy.weight_adapter.LoRAAdapter,
+                                  comfy.weight_adapter.LoHaAdapter,
+                                  comfy.weight_adapter.LoKrAdapter,
+                                  comfy.weight_adapter.GLoRAAdapter)):
+                return False
+            w = v.weights
+            dora_slot = {
+                comfy.weight_adapter.LoRAAdapter: 4,
+                comfy.weight_adapter.LoHaAdapter: 7,
+                comfy.weight_adapter.LoKrAdapter: 8,
+                comfy.weight_adapter.GLoRAAdapter: 5,
+            }[type(v)]
+            if len(w) > dora_slot and w[dora_slot] is not None:
+                return False
+            # LoRAAdapter slot 5 is a reshape spec — would change weight shape.
+            if isinstance(v, comfy.weight_adapter.LoRAAdapter) and len(w) > 5 and w[5] is not None:
+                return False
+            continue
         if len(v) == 1:
-            patch_type = "diff"
             diff = v[0]
             pad = False
-        elif len(v) == 2:
-            patch_type = v[0]
+        elif len(v) == 2 and v[0] == "diff":
             vv = v[1]
-            if patch_type == "diff":
-                diff = vv[0]
-                pad = len(vv) > 1 and vv[1].get('pad_weight', False)
-            else:
-                return False
+            diff = vv[0]
+            pad = len(vv) > 1 and vv[1].get('pad_weight', False)
         else:
             return False
-        if patch_type != "diff":
+        if pad or diff.shape != weight_shape:
             return False
-        if pad:
-            return False
-        # shape mismatch will no-op in calculate_weight but we still need delta on
-        # a matching-shape zero scratch; require exact match.
-        # We cannot check against the live weight here - defer to caller.
-        _ = diff
     return True
-from comfy.comfy_types import UnetWrapperFunction
-from comfy.quant_ops import QuantizedTensor
-from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
-import comfy_aimdo.model_vbar
 
 def set_model_options_patch_replace(model_options, patch, name, block_name, number, transformer_index=None):
     to = model_options["transformer_options"].copy()
@@ -751,15 +722,10 @@ class ModelPatcher:
             hbk = self.hook_backup.get(k, None)
             weight, set_func, convert_func = get_key_weight(self.model, k)
             if bk is not None:
-                if getattr(bk, 'invertible', False):
-                    # Fast-path marker: live weight is patched in place. Reconstruct
-                    # the original by subtracting the delta (allocates a fresh
-                    # tensor, but get_key_patches is off the hot path).
-                    temp_dtype = comfy.model_management.lora_compute_dtype(weight.device)
-                    zero_scratch = torch.zeros(weight.shape, dtype=temp_dtype, device=weight.device)
-                    delta = comfy.lora.calculate_weight(self.patches[k], zero_scratch, k)
-                    delta = comfy.float.stochastic_rounding(delta, weight.dtype, seed=comfy.utils.string_to_seed(k))
-                    weight = weight - delta
+                if bk.invertible:
+                    # Live weight was patched in place; reconstruct the original
+                    # by subtracting the recomputed delta. Off the hot path.
+                    weight = self._compute_invertible_unpatched(k, weight)
                 else:
                     weight = bk.weight
             if hbk is not None:
@@ -790,31 +756,18 @@ class ModelPatcher:
 
         inplace_update = self.weight_inplace_update or inplace_update
 
-        # Fast path: on unified memory with assign=True, if every patch on this
-        # key is a purely additive constant delta, mutate the live weight in
-        # place using a per-layer fp32 scratch to extract the delta from a zero
-        # base. This eliminates the full-model temp_weight copy that otherwise
-        # doubles memory at LoRA-toggle time (60GB+ for Flux2). Backup becomes
-        # an "invertible marker" - unpatch recomputes the delta from
-        # self.patches[key] and subtracts it, no original tensor stored.
+        # Unified-memory fast path: avoids the legacy full-model temp_weight +
+        # set_attr_param duplicate at LoRA-toggle time (~60GB for Flux2) by
+        # mutating the live weight in place. Backup is an invertible marker;
+        # unpatch recomputes the delta from self.patches[key] and subtracts it.
         assign_backup = self.should_assign_weights() and not inplace_update
         fast_path = (
             assign_backup
             and not return_weight
             and set_func is None
             and convert_func is None
-            and _patches_are_invertible(self.patches[key])
+            and _patches_are_invertible(self.patches[key], weight.shape)
         )
-        if fast_path:
-            for p in self.patches[key]:
-                v = p[1]
-                if isinstance(v, comfy.weight_adapter.WeightAdapterBase):
-                    continue
-                diff = v[0] if len(v) == 1 else v[1][0]
-                if diff.shape != weight.shape:
-                    fast_path = False
-                    break
-
         if fast_path:
             if key not in self.backup:
                 if len(self.backup) == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -822,13 +775,13 @@ class ModelPatcher:
                                   type(self.model).__name__, len(self.patches),
                                   comfy.model_management.get_free_memory(self.load_device))
                 self.backup[key] = WeightBackup(weight=None, inplace_update=False, invertible=True)
-            compute_device = weight.device if device_to is None else device_to
-            temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
-            zero_scratch = torch.zeros(weight.shape, dtype=temp_dtype, device=compute_device)
-            delta = comfy.lora.calculate_weight(self.patches[key], zero_scratch, key)
-            delta = comfy.float.stochastic_rounding(delta, weight.dtype, seed=comfy.utils.string_to_seed(key))
-            weight.add_(delta)
-            del delta, zero_scratch
+            scratch_dtype = comfy.model_management.lora_compute_dtype(weight.device)
+            scratch = torch.zeros(weight.shape, dtype=scratch_dtype, device=weight.device)
+            scratch = comfy.lora.calculate_weight(self.patches[key], scratch, key)
+            rounded = comfy.float.stochastic_rounding(scratch, weight.dtype, seed=comfy.utils.string_to_seed(key))
+            del scratch
+            weight.add_(rounded)
+            del rounded
             return
 
         if key not in self.backup and not return_weight:
@@ -863,15 +816,29 @@ class ModelPatcher:
         else:
             return set_func(out_weight, inplace_update=inplace_update, seed=comfy.utils.string_to_seed(key), return_weight=return_weight)
 
+    def _compute_rounded_delta(self, key, weight):
+        """Recompute the additive delta for `key` rounded to weight.dtype.
+        Frees the fp32 scratch before returning so the caller's combine step
+        runs at a lower memory high-water mark."""
+        scratch_dtype = comfy.model_management.lora_compute_dtype(weight.device)
+        scratch = torch.zeros(weight.shape, dtype=scratch_dtype, device=weight.device)
+        scratch = comfy.lora.calculate_weight(self.patches[key], scratch, key)
+        rounded = comfy.float.stochastic_rounding(scratch, weight.dtype, seed=comfy.utils.string_to_seed(key))
+        del scratch
+        return rounded
+
     def _invert_fast_path_weight(self, key):
-        """Recompute the additive delta from self.patches[key] and subtract it
-        in place from the live weight, restoring the original value."""
+        """Restore the original value of a fast-path-patched live weight by
+        subtracting the recomputed delta in place."""
         weight, _, _ = get_key_weight(self.model, key)
-        temp_dtype = comfy.model_management.lora_compute_dtype(weight.device)
-        zero_scratch = torch.zeros(weight.shape, dtype=temp_dtype, device=weight.device)
-        delta = comfy.lora.calculate_weight(self.patches[key], zero_scratch, key)
-        delta = comfy.float.stochastic_rounding(delta, weight.dtype, seed=comfy.utils.string_to_seed(key))
+        delta = self._compute_rounded_delta(key, weight)
         weight.sub_(delta)
+
+    def _compute_invertible_unpatched(self, key, weight):
+        """Return a fresh tensor holding the original (pre-patch) value of a
+        fast-path-patched weight without mutating the live tensor."""
+        delta = self._compute_rounded_delta(key, weight)
+        return torch.sub(weight, delta)
 
     def pin_weight_to_device(self, key):
         weight, set_func, convert_func = get_key_weight(self.model, key)
@@ -1088,7 +1055,7 @@ class ModelPatcher:
 
             for k in keys:
                 bk = self.backup[k]
-                if getattr(bk, 'invertible', False):
+                if bk.invertible:
                     self._invert_fast_path_weight(k)
                 elif bk.inplace_update:
                     comfy.utils.copy_to_param(self.model, k, bk.weight)
@@ -1149,7 +1116,7 @@ class ModelPatcher:
                                 self.unpatch_hooks()
                                 hooks_unpatched = True
 
-                            if getattr(bk, 'invertible', False):
+                            if bk.invertible:
                                 self._invert_fast_path_weight(key)
                             elif bk.inplace_update:
                                 comfy.utils.copy_to_param(self.model, key, bk.weight)
@@ -1746,7 +1713,7 @@ class ModelPatcherDynamic(ModelPatcher):
                     key = key_param_name_to_key(n, param_key)
                     if key in self.backup:
                         bk = self.backup[key]
-                        if getattr(bk, 'invertible', False):
+                        if bk.invertible:
                             # Fast-path: live weight already holds the patched
                             # value. Revert so patch_weight_to_device can
                             # reapply cleanly (it also drops the backup entry
@@ -1824,7 +1791,7 @@ class ModelPatcherDynamic(ModelPatcher):
         if freed < memory_to_free:
             for key in list(self.backup.keys()):
                 bk = self.backup.pop(key)
-                if getattr(bk, 'invertible', False):
+                if bk.invertible:
                     self._invert_fast_path_weight(key)
                 else:
                     comfy.utils.set_attr_param(self.model, key, bk.weight)
