@@ -692,7 +692,18 @@ class ModelPatcher:
         inplace_update = self.weight_inplace_update or inplace_update
 
         if key not in self.backup and not return_weight:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            if len(self.backup) == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug("patch_weight_to_device: model=%s patches=%d backup=%s free_mem=%d",
+                              type(self.model).__name__, len(self.patches),
+                              "reference" if (self.should_assign_weights() and not inplace_update) else "copy-to-offload",
+                              comfy.model_management.get_free_memory(self.load_device))
+            # On unified memory with assign=True, weights are live tensors we own;
+            # set_attr_param rebinds rather than mutates, so storing the original tensor
+            # reference in self.backup restores correctly without duplicating memory.
+            if self.should_assign_weights() and not inplace_update:
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight, inplace_update)
+            else:
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
         if device_to is not None:
