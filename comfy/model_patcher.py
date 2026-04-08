@@ -43,9 +43,14 @@ import comfy_aimdo.model_vbar
 
 # weight=None + invertible=True marks the unified-memory fast path: the live
 # weight has been mutated in place and the original is recovered by recomputing
-# the additive delta from self.patches[key], not by reading bk.weight.
+# the additive delta from the snapshotted patches stored on the backup entry.
+# The patches list is snapshotted at patch time because clones share self.backup
+# by reference but not self.patches — using self.patches[key] at unpatch time
+# can KeyError when a clone with no LoRA reverts entries left by a sibling clone.
 WeightBackup = collections.namedtuple(
-    'WeightBackup', ['weight', 'inplace_update', 'invertible'], defaults=[False],
+    'WeightBackup',
+    ['weight', 'inplace_update', 'invertible', 'patches'],
+    defaults=[False, None],
 )
 
 
@@ -725,7 +730,7 @@ class ModelPatcher:
                 if bk.invertible:
                     # Live weight was patched in place; reconstruct the original
                     # by subtracting the recomputed delta. Off the hot path.
-                    weight = self._compute_invertible_unpatched(k, weight)
+                    weight = self._compute_invertible_unpatched(k, weight, bk.patches)
                 else:
                     weight = bk.weight
             if hbk is not None:
@@ -774,7 +779,12 @@ class ModelPatcher:
                     logging.debug("patch_weight_to_device: model=%s patches=%d backup=invertible-marker free_mem=%d",
                                   type(self.model).__name__, len(self.patches),
                                   comfy.model_management.get_free_memory(self.load_device))
-                self.backup[key] = WeightBackup(weight=None, inplace_update=False, invertible=True)
+                self.backup[key] = WeightBackup(
+                    weight=None,
+                    inplace_update=False,
+                    invertible=True,
+                    patches=list(self.patches[key]),
+                )
             scratch_dtype = comfy.model_management.lora_compute_dtype(weight.device)
             scratch = torch.zeros(weight.shape, dtype=scratch_dtype, device=weight.device)
             scratch = comfy.lora.calculate_weight(self.patches[key], scratch, key)
@@ -816,28 +826,28 @@ class ModelPatcher:
         else:
             return set_func(out_weight, inplace_update=inplace_update, seed=comfy.utils.string_to_seed(key), return_weight=return_weight)
 
-    def _compute_rounded_delta(self, key, weight):
+    def _compute_rounded_delta(self, key, weight, patches):
         """Recompute the additive delta for `key` rounded to weight.dtype.
         Frees the fp32 scratch before returning so the caller's combine step
         runs at a lower memory high-water mark."""
         scratch_dtype = comfy.model_management.lora_compute_dtype(weight.device)
         scratch = torch.zeros(weight.shape, dtype=scratch_dtype, device=weight.device)
-        scratch = comfy.lora.calculate_weight(self.patches[key], scratch, key)
+        scratch = comfy.lora.calculate_weight(patches, scratch, key)
         rounded = comfy.float.stochastic_rounding(scratch, weight.dtype, seed=comfy.utils.string_to_seed(key))
         del scratch
         return rounded
 
-    def _invert_fast_path_weight(self, key):
+    def _invert_fast_path_weight(self, key, patches):
         """Restore the original value of a fast-path-patched live weight by
         subtracting the recomputed delta in place."""
         weight, _, _ = get_key_weight(self.model, key)
-        delta = self._compute_rounded_delta(key, weight)
+        delta = self._compute_rounded_delta(key, weight, patches)
         weight.sub_(delta)
 
-    def _compute_invertible_unpatched(self, key, weight):
+    def _compute_invertible_unpatched(self, key, weight, patches):
         """Return a fresh tensor holding the original (pre-patch) value of a
         fast-path-patched weight without mutating the live tensor."""
-        delta = self._compute_rounded_delta(key, weight)
+        delta = self._compute_rounded_delta(key, weight, patches)
         return torch.sub(weight, delta)
 
     def pin_weight_to_device(self, key):
@@ -1056,7 +1066,7 @@ class ModelPatcher:
             for k in keys:
                 bk = self.backup[k]
                 if bk.invertible:
-                    self._invert_fast_path_weight(k)
+                    self._invert_fast_path_weight(k, bk.patches)
                 elif bk.inplace_update:
                     comfy.utils.copy_to_param(self.model, k, bk.weight)
                 else:
@@ -1117,7 +1127,7 @@ class ModelPatcher:
                                 hooks_unpatched = True
 
                             if bk.invertible:
-                                self._invert_fast_path_weight(key)
+                                self._invert_fast_path_weight(key, bk.patches)
                             elif bk.inplace_update:
                                 comfy.utils.copy_to_param(self.model, key, bk.weight)
                             else:
@@ -1718,7 +1728,7 @@ class ModelPatcherDynamic(ModelPatcher):
                             # value. Revert so patch_weight_to_device can
                             # reapply cleanly (it also drops the backup entry
                             # before recomputing the delta).
-                            self._invert_fast_path_weight(key)
+                            self._invert_fast_path_weight(key, bk.patches)
                             self.backup.pop(key)
                         else:
                             comfy.utils.set_attr_param(self.model, key, bk.weight)
@@ -1792,7 +1802,7 @@ class ModelPatcherDynamic(ModelPatcher):
             for key in list(self.backup.keys()):
                 bk = self.backup.pop(key)
                 if bk.invertible:
-                    self._invert_fast_path_weight(key)
+                    self._invert_fast_path_weight(key, bk.patches)
                 else:
                     comfy.utils.set_attr_param(self.model, key, bk.weight)
             for key in list(self.backup_buffers.keys()):
