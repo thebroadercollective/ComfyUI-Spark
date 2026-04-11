@@ -21,6 +21,7 @@ import logging
 import psutil
 
 import comfy.model_management as mm
+from comfy.cli_args import _VALID_CACHE_PHASES as _cli_valid
 from comfy.cli_args import args
 
 
@@ -32,6 +33,16 @@ class CachePhase(enum.Enum):
     POST_CHECKPOINT_LOAD = "post_checkpoint_load"
     PRE_INFERENCE = "pre_inference"
     POST_INFERENCE = "post_inference"
+
+
+# Keep the CLI validator (cli_args._VALID_CACHE_PHASES) in sync with CachePhase.
+# cli_args cannot import CachePhase without a circular import, so it mirrors
+# the phase names as a plain frozenset of strings. This assertion re-anchors
+# that duplication to the enum at import time; any drift fails fast.
+assert _cli_valid == frozenset(p.value for p in CachePhase), (
+    f"cli_args._VALID_CACHE_PHASES {_cli_valid} drifted from "
+    f"CachePhase {frozenset(p.value for p in CachePhase)}"
+)
 
 
 # Preset -> active phases. A phase present in the set triggers a drop at
@@ -68,8 +79,28 @@ _PRESET_GC_PHASES: dict[str, frozenset[CachePhase]] = {
 }
 
 
+# Enforce the GC-subset invariant at import time. Any future edit that adds
+# a phase to _PRESET_GC_PHASES without also adding it to _PRESET_PHASES would
+# silently become a no-op (the early return in _maybe_drop_impl skips the
+# block because `preset_fires = phase in active` is False); turn that into
+# a fail-fast startup error instead.
+for _preset_name, _gc_set in _PRESET_GC_PHASES.items():
+    assert _gc_set.issubset(_PRESET_PHASES[_preset_name]), (
+        f"_PRESET_GC_PHASES[{_preset_name!r}] must be a subset of "
+        f"_PRESET_PHASES[{_preset_name!r}]; violation: "
+        f"{_gc_set - _PRESET_PHASES[_preset_name]}"
+    )
+
+
 # Module-level tracker so maybe_drop() logs at-most-once per phase on failure.
 _drop_failures_seen: set[CachePhase] = set()
+
+
+# Cache of the parsed --cache-drop-at override. Populated on first access by
+# _get_override_phases(); keyed implicitly by the `args.cache_drop_at` string,
+# which argparse populates once at startup and never mutates afterward.
+_parsed_override: frozenset[CachePhase] | None = None
+_parsed_override_raw: str | None = None
 
 
 def _parse_phase_override(phase_list_str: str) -> frozenset[CachePhase]:
@@ -90,21 +121,40 @@ def _parse_phase_override(phase_list_str: str) -> frozenset[CachePhase]:
     return frozenset(out)
 
 
+def _get_override_phases() -> frozenset[CachePhase] | None:
+    """Return the parsed --cache-drop-at set, or None if no override is set.
+
+    Caches the parse result on first call. argparse has already validated the
+    raw string via cli_args._cache_drop_at_type, so _parse_phase_override
+    should never raise here — but it's kept defensive for hand-set args
+    objects in tests.
+    """
+    global _parsed_override, _parsed_override_raw
+    raw = getattr(args, "cache_drop_at", None)
+    if not raw:
+        return None
+    if raw != _parsed_override_raw:
+        _parsed_override = _parse_phase_override(raw)
+        _parsed_override_raw = raw
+    return _parsed_override
+
+
 def _active_phases() -> frozenset[CachePhase]:
-    override = getattr(args, "cache_drop_at", None)
-    if override:
-        return _parse_phase_override(override)
+    override = _get_override_phases()
+    if override is not None:
+        return override
     preset = getattr(args, "cache_aggressiveness", "normal")
     return _PRESET_PHASES.get(preset, _PRESET_PHASES["normal"])
 
 
 def _gc_phases() -> frozenset[CachePhase]:
-    override = getattr(args, "cache_drop_at", None)
-    if override:
+    override = _get_override_phases()
+    if override is not None:
         # With an explicit override, we don't second-guess: every phase in the
         # override triggers gc.collect() as well. Users asking for a specific
-        # phase list are debugging and want the full hammer.
-        return _parse_phase_override(override)
+        # phase list are debugging and want the full hammer. (This behavior
+        # is documented in the --cache-drop-at help text.)
+        return override
     preset = getattr(args, "cache_aggressiveness", "normal")
     return _PRESET_GC_PHASES.get(preset, _PRESET_GC_PHASES["normal"])
 
