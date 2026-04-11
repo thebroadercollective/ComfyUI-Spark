@@ -1826,14 +1826,10 @@ def _fmt_gb(n_bytes) -> str:
     except Exception:
         return "?G"
 
-def memory_report(label: str = "", *, device=None) -> str:
-    del label  # reserved for future use; call sites prepend their own label
+def memory_report(*, device=None) -> str:
     torch_part = None
     if torch.cuda.is_available():
-        try:
-            dev = device if device is not None else torch.cuda.current_device()
-        except Exception:
-            dev = device
+        dev = device if device is not None else torch.cuda.current_device()
         try:
             alloc = _fmt_gb(torch.cuda.memory_allocated(dev))
         except Exception:
@@ -1851,13 +1847,9 @@ def memory_report(label: str = "", *, device=None) -> str:
     try:
         vm = psutil.virtual_memory()
         sys_avail = _fmt_gb(vm.available)
+        sys_used = _fmt_gb(vm.used)
     except Exception:
-        sys_avail = "?G"
-    try:
-        vm_used = psutil.virtual_memory()
-        sys_used = _fmt_gb(vm_used.used)
-    except Exception:
-        sys_used = "?G"
+        sys_avail = sys_used = "?G"
     sys_part = "sys avail {} used {}".format(sys_avail, sys_used)
 
     if torch_part is None:
@@ -1884,8 +1876,8 @@ def memory_delta(before: str, after: str) -> str:
     b_sys = _parse_gb_field(before, "sys avail ")
     a_sys = _parse_gb_field(after, "sys avail ")
     if None in (b_alloc, a_alloc, b_sys, a_sys):
-        return "Δtorch ?G Δsys ?G"
-    return "Δtorch {:+.1f}G Δsys {:+.1f}G".format(a_alloc - b_alloc, a_sys - b_sys)
+        return "Δtorch ?G Δavail ?G"
+    return "Δtorch {:+.1f}G Δavail {:+.1f}G".format(a_alloc - b_alloc, a_sys - b_sys)
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())
