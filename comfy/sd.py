@@ -1656,6 +1656,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         _unet_bytes = parameters * _dtype_to_bytes(weight_dtype)
     except Exception:
         _unet_bytes = 0
+    _vae_bytes = 0
+    _clip_bytes = 0
 
     custom_operations = model_options.get("custom_operations", None)
     if custom_operations is None:
@@ -1664,6 +1666,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix, metadata=metadata)
     if model_config is None:
         logging.warning("Warning, This is not a checkpoint file, trying to load it as a diffusion model only.")
+        logging.info("CHECKPOINT_SLICE done (fallback) | %s",
+                     model_management.memory_delta(slice_start, model_management.memory_report()))
         diffusion_model = load_diffusion_model_state_dict(sd, model_options={})
         if diffusion_model is None:
             return None
@@ -1772,16 +1776,17 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
                 clip = CLIP(clip_target, embedding_directory=embedding_directory, tokenizer_data=clip_sd, parameters=parameters, state_dict=clip_sd, model_options=te_model_options, disable_dynamic=disable_dynamic)
             else:
                 logging.warning("no CLIP/text encoder weights in checkpoint, the text encoder model will not be loaded.")
-        _clip_target_name = getattr(clip_target, "clip", None)
-        if _clip_target_name is None:
-            _clip_target_name = type(clip_target).__name__ if clip_target is not None else "None"
-        else:
-            _clip_target_name = getattr(_clip_target_name, "__name__", str(_clip_target_name))
-        logging.info(
-            "CLIP_LOADED target=%s | %s",
-            _clip_target_name,
-            model_management.memory_delta(clip_before, model_management.memory_report()),
-        )
+        if clip is not None:
+            _clip_target_name = getattr(clip_target, "clip", None)
+            if _clip_target_name is None:
+                _clip_target_name = type(clip_target).__name__ if clip_target is not None else "None"
+            else:
+                _clip_target_name = getattr(_clip_target_name, "__name__", str(_clip_target_name))
+            logging.info(
+                "CLIP_LOADED target=%s | %s",
+                _clip_target_name,
+                model_management.memory_delta(clip_before, model_management.memory_report()),
+            )
 
     left_over = sd.keys()
     if len(left_over) > 0:
