@@ -160,6 +160,39 @@ parser.add_argument("--force-non-blocking", action="store_true", help="Force Com
 parser.add_argument("--default-hashing-function", type=str, choices=['md5', 'sha1', 'sha256', 'sha512'], default='sha256', help="Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.")
 
 parser.add_argument("--disable-smart-memory", action="store_true", help="Force ComfyUI to agressively offload to regular ram instead of keeping models in vram when it can.")
+
+parser.add_argument(
+    "--cache-aggressiveness",
+    type=str,
+    choices=["off", "low", "normal", "high", "paranoid"],
+    default="normal",
+    help="Cache drop aggressiveness preset for the model loader. off = no drops; "
+         "low = one drop at checkpoint-load; normal = drops at checkpoint-load and "
+         "pre-inference (default); high = adds post-file-load and post-model-init; "
+         "paranoid = every phase (debugging only, slow).",
+)
+
+parser.add_argument(
+    "--cache-drop-at",
+    type=str,
+    default=None,
+    metavar="PHASE[,PHASE...]",
+    help="Explicit comma-separated list of cache phases to drop at, overriding "
+         "--cache-aggressiveness. Valid phases: pre_checkpoint_load, post_file_load, "
+         "post_checkpoint_slice, post_model_init, post_checkpoint_load, pre_inference, "
+         "post_inference.",
+)
+
+parser.add_argument(
+    "--cache-drop-threshold-gb",
+    type=float,
+    default=None,
+    metavar="GB",
+    help="Memory-pressure watermark: drop caches (with gc.collect) at any phase "
+         "hook when psutil.virtual_memory().available falls below this threshold. "
+         "Orthogonal to --cache-aggressiveness. Default: unset (watermark inactive).",
+)
+
 parser.add_argument("--deterministic", action="store_true", help="Make pytorch use slower deterministic algorithms when it can. Note that this might not make images deterministic in all cases.")
 
 class PerformanceFeature(enum.Enum):
