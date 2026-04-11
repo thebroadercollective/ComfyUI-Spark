@@ -19,6 +19,7 @@
 import comfy.ldm.hunyuan3dv2_1
 import comfy.ldm.hunyuan3dv2_1.hunyuandit
 import torch
+import gc
 import logging
 import comfy.ldm.lightricks.av_model
 import comfy.context_windows
@@ -344,6 +345,9 @@ class BaseModel(torch.nn.Module):
         if len(u) > 0:
             logging.warning("unet unexpected: {}".format(u))
         del to_load
+        if assign:
+            # Drop the pre-allocated parameter buffers replaced by assign=True
+            gc.collect()
         return self
 
     def process_latent_in(self, latent):
