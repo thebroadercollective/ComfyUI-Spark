@@ -36,6 +36,7 @@ import json
 import time
 import threading
 import warnings
+import psutil
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
@@ -124,30 +125,100 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    basename = os.path.basename(ckpt)
+    try:
+        total_size = os.path.getsize(ckpt)
+    except Exception:
+        total_size = 0
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         import comfy.model_management
         try:
+            unified = comfy.model_management.UNIFIED_MEMORY
+            if comfy.memory_management.aimdo_enabled:
+                method = "aimdo"
+            elif unified and not explicit_device:
+                method = "unified-cuda"
+            elif explicit_device and device.type == "cpu":
+                method = "cpu-explicit"
+            elif explicit_device and device.type == "cuda":
+                method = "cuda-explicit"
+            else:
+                method = "mmap"
+
+            load_start_snap = comfy.model_management.memory_report()
+            load_start_time = time.perf_counter()
+            logging.info(
+                "LOAD file=%s size=%.1fG method=%s | %s",
+                basename, total_size / (1024 ** 3), method, load_start_snap,
+            )
+
             if comfy.memory_management.aimdo_enabled:
                 sd, metadata = load_safetensors(ckpt)
                 if not return_metadata:
                     metadata = None
+                tensors_loaded = len(sd)
             else:
-                unified = comfy.model_management.UNIFIED_MEMORY
                 if unified and not explicit_device:
                     load_device = "cuda"
-                    logging.debug("Unified memory: loading %s directly to CUDA", os.path.basename(ckpt))
+                    logging.debug("Unified memory: loading %s directly to CUDA", basename)
                 else:
                     load_device = device.type
 
                 with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
                     sd = {}
-                    for k in f.keys():
+                    tick_enabled = (
+                        logging.getLogger().isEnabledFor(logging.INFO)
+                        and total_size >= 5 * 1024 ** 3
+                    )
+                    bytes_loaded = 0
+                    tensors_loaded = 0
+                    last_tick_time = load_start_time
+                    last_tick_bytes = 0
+                    key_list = list(f.keys())
+                    total_count = len(key_list)
+                    for k in key_list:
                         tensor = f.get_tensor(k)
                         if DISABLE_MMAP and not unified:
                             tensor = tensor.to(device=device, copy=True)
                         sd[k] = tensor
+                        if tick_enabled:
+                            try:
+                                bytes_loaded += tensor.element_size() * tensor.numel()
+                            except Exception:
+                                pass
+                            tensors_loaded += 1
+                            now = time.perf_counter()
+                            if (now - last_tick_time) >= 2.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                                try:
+                                    sys_avail = psutil.virtual_memory().available / (1024 ** 3)
+                                    sys_avail_str = "{:.1f}G".format(sys_avail)
+                                except Exception:
+                                    sys_avail_str = "?G"
+                                pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
+                                logging.info(
+                                    "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
+                                    basename,
+                                    bytes_loaded / (1024 ** 3),
+                                    total_size / (1024 ** 3),
+                                    pct,
+                                    tensors_loaded,
+                                    total_count,
+                                    sys_avail_str,
+                                )
+                                last_tick_time = now
+                                last_tick_bytes = bytes_loaded
+                        else:
+                            tensors_loaded += 1
                     if return_metadata:
                         metadata = f.metadata()
+
+            metadata_keys = len(metadata) if (return_metadata and metadata is not None) else 0
+            elapsed = time.perf_counter() - load_start_time
+            logging.info(
+                "LOAD done file=%s elapsed=%.1fs tensors=%d metadata_keys=%d | %s",
+                basename, elapsed, tensors_loaded, metadata_keys,
+                comfy.model_management.memory_delta(load_start_snap, comfy.model_management.memory_report()),
+            )
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -157,9 +228,17 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                     raise ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
             raise e
     else:
+        import comfy.model_management
         torch_args = {}
         if MMAP_TORCH_FILES:
             torch_args["mmap"] = True
+
+        load_start_snap = comfy.model_management.memory_report()
+        load_start_time = time.perf_counter()
+        logging.info(
+            "LOAD file=%s size=%.1fG method=%s | %s",
+            basename, total_size / (1024 ** 3), "torch-pickle", load_start_snap,
+        )
 
         pl_sd = torch.load(ckpt, map_location=device, weights_only=True, **torch_args)
 
@@ -173,6 +252,16 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                     sd = pl_sd
             else:
                 sd = pl_sd
+        try:
+            tensors_loaded = len(sd) if isinstance(sd, dict) else 0
+        except Exception:
+            tensors_loaded = 0
+        elapsed = time.perf_counter() - load_start_time
+        logging.info(
+            "LOAD done file=%s elapsed=%.1fs tensors=%d metadata_keys=0 | %s",
+            basename, elapsed, tensors_loaded,
+            comfy.model_management.memory_delta(load_start_snap, comfy.model_management.memory_report()),
+        )
     return (sd, metadata) if return_metadata else sd
 
 def save_torch_file(sd, ckpt, metadata=None):

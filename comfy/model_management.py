@@ -734,7 +734,14 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     return unloaded_models
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+    _lmg_entry_snap = memory_report()
+    logging.info(
+        "LOAD_MODELS_GPU requested=%s | %s",
+        [type(m.model).__name__ for m in models if hasattr(m, "model")],
+        _lmg_entry_snap,
+    )
     cleanup_models_gc()
+    logging.info("POST_GC | %s", memory_delta(_lmg_entry_snap, memory_report()))
     global vram_state
 
     inference_memory = minimum_inference_memory()
@@ -836,6 +843,12 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        logging.info(
+            "MODEL_GPU_READY %s target=%s | %s",
+            type(loaded_model.model).__name__ if hasattr(loaded_model, "model") else "?",
+            torch_dev,
+            memory_report(),
+        )
         current_loaded_models.insert(0, loaded_model)
     return
 
