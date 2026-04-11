@@ -1,11 +1,12 @@
 ## Context
 
 The DGX Spark is GB10 (sm_121) with 128GB unified LPDDR5x. Stock PyPI
-wheels target a broad arch set and often rely on PTX/JIT fallbacks for
-newer SMs, which can add startup overhead and binary bloat. The user has
-already built `sageattention` from source (with Triton disabled due to
-reported stability problems on SM121) and wants a scoping list of what
-else might be worth building from source.
+wheels are widely reported to target a broad arch set (verify against
+the PyTorch wheel build manifest) and may fall back to PTX/JIT for
+unsupported SMs, which could add startup overhead and binary bloat. The
+user has already built `sageattention` from source (with Triton disabled
+due to reported stability problems on SM121) and wants a scoping list of
+what else might be worth building from source.
 
 This note is a scoping document, not a build guide. Each candidate has a
 one-line purpose, a cost/benefit sketch, and a recommendation.
@@ -15,7 +16,7 @@ one-line purpose, a cost/benefit sketch, and a recommendation.
 ### 1. Flash Attention 3
 
 - **Purpose.** Newer attention kernel library competitive with sageattention
-  on some shapes; supposedly better on long-sequence forward passes.
+  on some shapes; reportedly better on long-sequence forward passes.
 - **Cost/benefit on Spark.** SM121 support is uncertain — FA3 is primarily
   targeted at Hopper/SM90+, and it is not clear whether the Blackwell-class
   SM121 path is compiled or falls back. Build cost is moderate (CUDA
@@ -91,7 +92,7 @@ one-line purpose, a cost/benefit sketch, and a recommendation.
   inside it.
 - **Recommendation. Skip.**
 
-## What I'm NOT including and why
+## Deliberately excluded
 
 - **xformers-flash / flash-attn-v2** — strictly older than FA3; if FA3 is useful, v2 is subsumed.
 - **DeepSpeed** — distributed training/inference runtime; single-node Spark does not need it.
