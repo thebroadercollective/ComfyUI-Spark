@@ -1,3 +1,4 @@
+import atexit
 import math
 import sys
 
@@ -525,6 +526,7 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
 
 @wrap_attn
 def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    global _sage_first_call_logged, _sage_call_count, _sage_fallback_count
     if kwargs.get("low_precision_attention", True) is False:
         return attention_pytorch(q, k, v, heads, mask=mask, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
@@ -551,8 +553,17 @@ def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=
 
     try:
         out = sageattn(q, k, v, attn_mask=mask, is_causal=False, tensor_layout=tensor_layout)
+        if not _sage_first_call_logged:
+            logging.info(
+                "[attention] sageattn first call ok: layout=%s q=%s k=%s v=%s dtype=%s mask=%s",
+                tensor_layout, tuple(q.shape), tuple(k.shape), tuple(v.shape), q.dtype,
+                "yes" if mask is not None else "no",
+            )
+            _sage_first_call_logged = True
+        _sage_call_count += 1
     except Exception as e:
         logging.error("Error running sage attention: {}, using pytorch attention instead.".format(e))
+        _sage_fallback_count += 1
         exception_fallback = True
     if exception_fallback:
         if tensor_layout == "NHD":
@@ -576,6 +587,7 @@ def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=
 
 @wrap_attn
 def attention3_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    global _sage3_first_call_logged, _sage3_call_count, _sage3_fallback_count
     exception_fallback = False
     if (q.device.type != "cuda" or
         q.dtype not in (torch.float16, torch.bfloat16) or
@@ -635,8 +647,17 @@ def attention3_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
     try:
         out = sageattn3_blackwell(q_s, k_s, v_s, is_causal=False)
+        if not _sage3_first_call_logged:
+            logging.info(
+                "[attention] sageattn3 first call ok: layout=HND q=%s k=%s v=%s dtype=%s mask=%s",
+                tuple(q_s.shape), tuple(k_s.shape), tuple(v_s.shape), q_s.dtype,
+                "yes" if mask is not None else "no",
+            )
+            _sage3_first_call_logged = True
+        _sage3_call_count += 1
     except Exception as e:
         exception_fallback = True
+        _sage3_fallback_count += 1
         logging.error("Error running SageAttention3: %s, falling back to pytorch attention.", e)
 
     if exception_fallback:
@@ -720,10 +741,17 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 
+_sage_first_call_logged = False
+_sage_call_count = 0
+_sage_fallback_count = 0
+_sage3_first_call_logged = False
+_sage3_call_count = 0
+_sage3_fallback_count = 0
+
 optimized_attention = attention_basic
 
 if model_management.sage_attention_enabled():
-    logging.info("Using sage attention")
+    logging.info("[attention] sage enabled at import (swap installed)")
     optimized_attention = attention_sage
 elif model_management.xformers_enabled():
     logging.info("Using xformers attention")
@@ -743,6 +771,19 @@ else:
         optimized_attention = attention_sub_quad
 
 optimized_attention_masked = optimized_attention
+
+
+def _log_attention_shutdown_summary():
+    if _sage_call_count or _sage_fallback_count or _sage3_call_count or _sage3_fallback_count:
+        logging.info(
+            "[attention] shutdown: sageattn_calls=%d sageattn_fallbacks=%d "
+            "sageattn3_calls=%d sageattn3_fallbacks=%d",
+            _sage_call_count, _sage_fallback_count,
+            _sage3_call_count, _sage3_fallback_count,
+        )
+
+
+atexit.register(_log_attention_shutdown_summary)
 
 
 # register core-supported attention functions
