@@ -1606,6 +1606,8 @@ def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, o
         "CHECKPOINT %s -> load_state_dict_guess_config | %s",
         _ckpt_basename, checkpoint_start_snap,
     )
+    import comfy.cache_policy as cache_policy
+    cache_policy.maybe_drop(cache_policy.CachePhase.PRE_CHECKPOINT_LOAD, reason=_ckpt_basename)
     sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
     out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata, disable_dynamic=disable_dynamic)
     if out is None:
@@ -1619,6 +1621,7 @@ def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, o
         _ckpt_basename,
         model_management.memory_delta(checkpoint_start_snap, model_management.memory_report()),
     )
+    cache_policy.maybe_drop(cache_policy.CachePhase.POST_CHECKPOINT_LOAD, reason=_ckpt_basename)
     return out
 
 def load_checkpoint_guess_config_model_only(ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
@@ -1716,6 +1719,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         if output_clipvision:
             clipvision = clip_vision.load_clipvision_from_sd(sd, model_config.clip_vision_prefix, True)
 
+    import comfy.cache_policy as cache_policy
+
     if output_model:
         inital_load_device = model_management.unet_inital_load_device(parameters, unet_dtype)
         model_init_before = model_management.memory_report()
@@ -1725,6 +1730,7 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
             model.__class__.__name__, inital_load_device,
             model_management.memory_delta(model_init_before, model_management.memory_report()),
         )
+        cache_policy.maybe_drop(cache_policy.CachePhase.POST_MODEL_INIT, reason=model.__class__.__name__)
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device())
         unet_load_before = model_management.memory_report()
@@ -1796,6 +1802,28 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         if inital_load_device != torch.device("cpu"):
             logging.info("loaded diffusion model directly to GPU")
             model_management.load_models_gpu([model_patcher], force_full_load=True)
+
+    # Explicit cleanup — on unified memory these tensor references share the
+    # same physical pool, so dangling refs prevent the allocator from reusing
+    # the memory until function scope exit or the next gc.collect().
+    try:
+        del sd
+    except NameError:
+        pass
+    try:
+        del vae_sd
+    except NameError:
+        pass
+    try:
+        del clip_sd
+    except NameError:
+        pass
+    try:
+        del out_sd
+    except NameError:
+        pass
+
+    cache_policy.maybe_drop(cache_policy.CachePhase.POST_CHECKPOINT_SLICE, reason="state_dict_partitioned")
 
     logging.info(
         "CHECKPOINT_SLICE done unet=%.1fG vae=%.1fG clip=%.1fG | %s",

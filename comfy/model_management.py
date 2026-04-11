@@ -742,6 +742,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
     )
     cleanup_models_gc()
     logging.info("POST_GC | %s", memory_delta(_lmg_entry_snap, memory_report()))
+    import comfy.cache_policy as cache_policy
+    cache_policy.maybe_drop(cache_policy.CachePhase.PRE_INFERENCE, reason="load_models_gpu")
     global vram_state
 
     inference_memory = minimum_inference_memory()
@@ -850,6 +852,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             memory_report(),
         )
         current_loaded_models.insert(0, loaded_model)
+    # TODO: POST_INFERENCE call site — needs execution pipeline hook
     return
 
 def load_model_gpu(model):
