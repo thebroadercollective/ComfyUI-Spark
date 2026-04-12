@@ -220,3 +220,50 @@ class TestMidLoadPageCacheDrop:
              patch("os.open", side_effect=failing_open):
             # Should not raise
             comfy.utils.load_torch_file(str(fake_file))
+
+    def test_drop_page_cache_flag_enables_on_non_unified(self, mock_comfy_env, tmp_path, monkeypatch):
+        """--drop-page-cache flag should enable mid-load drops even without unified memory."""
+        import comfy.utils
+        import comfy.model_management
+
+        mock_args, fake_size = mock_comfy_env
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", False)
+        mock_args.drop_page_cache = True
+
+        fake_file = tmp_path / "model.safetensors"
+        fake_file.write_bytes(b"fake")
+
+        opened_fds = []
+        real_open = os.open
+
+        def track_open(path, flags, *a, **kw):
+            fd = real_open(path, flags, *a, **kw)
+            if str(fake_file) == str(path):
+                opened_fds.append(fd)
+            return fd
+
+        mock_f = _make_mock_safe_open([])
+
+        with patch("comfy.utils.safetensors.safe_open", return_value=mock_f), \
+             patch("os.path.getsize", return_value=fake_size), \
+             patch("os.open", side_effect=track_open):
+            comfy.utils.load_torch_file(str(fake_file))
+
+        assert len(opened_fds) == 1, "--drop-page-cache should enable mid-load drop fd"
+
+    def test_post_load_drop_file_page_cache_called(self, mock_comfy_env, tmp_path):
+        """drop_file_page_cache should be called after loading completes."""
+        import comfy.utils
+        import comfy.model_management
+
+        fake_file = tmp_path / "model.safetensors"
+        fake_file.write_bytes(b"fake")
+        _, fake_size = mock_comfy_env
+
+        mock_f = _make_mock_safe_open([])
+
+        with patch("comfy.utils.safetensors.safe_open", return_value=mock_f), \
+             patch("os.path.getsize", return_value=fake_size):
+            comfy.utils.load_torch_file(str(fake_file))
+
+        comfy.model_management.drop_file_page_cache.assert_called_once_with(str(fake_file))
