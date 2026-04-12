@@ -228,6 +228,14 @@ parser.add_argument(
          "Orthogonal to --cache-aggressiveness. Default: unset (watermark inactive).",
 )
 
+parser.add_argument("--drop-page-cache", action="store_true",
+    help="After loading each safetensors file, advise the kernel to drop its "
+         "page cache pages via posix_fadvise(POSIX_FADV_DONTNEED). Reduces "
+         "memory pressure on unified-memory systems (DGX Spark) where mmap "
+         "pages from safetensors compete with model tensors for the same pool. "
+         "Linux only; no-op on other platforms. No root required. "
+         "Auto-enabled on unified memory systems.")
+
 parser.add_argument("--deterministic", action="store_true", help="Make pytorch use slower deterministic algorithms when it can. Note that this might not make images deterministic in all cases.")
 
 class PerformanceFeature(enum.Enum):

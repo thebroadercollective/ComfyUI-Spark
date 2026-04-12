@@ -188,7 +188,7 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                                 pass
                             tensors_loaded += 1
                             now = time.perf_counter()
-                            if (now - last_tick_time) >= 2.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                            if (now - last_tick_time) >= 15.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
                                 try:
                                     sys_avail = psutil.virtual_memory().available / (1024 ** 3)
                                     sys_avail_str = "{:.1f}G".format(sys_avail)
@@ -221,6 +221,16 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
             )
             import comfy.cache_policy as cache_policy
             cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
+            _should_drop_pc = getattr(args, 'drop_page_cache', False) or comfy.model_management.UNIFIED_MEMORY
+            if _should_drop_pc:
+                _pc_before = comfy.model_management.memory_report()
+                if comfy.model_management.drop_file_page_cache(ckpt):
+                    logging.info(
+                        "PAGE_CACHE_DROP file=%s size=%.1fG | %s",
+                        os.path.basename(ckpt),
+                        total_size / (1024 ** 3),
+                        comfy.model_management.memory_delta(_pc_before, comfy.model_management.memory_report()),
+                    )
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -266,6 +276,16 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         )
         import comfy.cache_policy as cache_policy
         cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
+        _should_drop_pc = getattr(args, 'drop_page_cache', False) or comfy.model_management.UNIFIED_MEMORY
+        if _should_drop_pc:
+            _pc_before = comfy.model_management.memory_report()
+            if comfy.model_management.drop_file_page_cache(ckpt):
+                logging.info(
+                    "PAGE_CACHE_DROP file=%s size=%.1fG | %s",
+                    os.path.basename(ckpt),
+                    total_size / (1024 ** 3),
+                    comfy.model_management.memory_delta(_pc_before, comfy.model_management.memory_report()),
+                )
     return (sd, metadata) if return_metadata else sd
 
 def save_torch_file(sd, ckpt, metadata=None):
