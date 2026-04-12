@@ -201,7 +201,7 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                                     pass
                                 tensors_loaded += 1
                                 now = time.perf_counter()
-                                if (now - last_tick_time) >= 15.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                                if (now - last_tick_time) >= 30.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
                                     try:
                                         sys_avail = psutil.virtual_memory().available / (1024 ** 3)
                                         sys_avail_str = "{:.1f}G".format(sys_avail)

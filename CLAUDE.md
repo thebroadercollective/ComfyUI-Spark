@@ -86,7 +86,7 @@ The load path emits INFO-level memory-accounting logs at phase boundaries. Key t
 
 `PAGE_CACHE_DROP` lines appear after each file load when `--drop-page-cache` is passed or on unified memory (auto-enabled). Uses `os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)` — non-privileged, per-file, Linux-only. This drops the OS page cache for the loaded safetensors file, which on unified memory competes with model tensors for the same physical pool. The helper `drop_file_page_cache(filepath)` lives in `model_management.py`. This is distinct from `soft_empty_cache_unified()` which clears the PyTorch CUDA allocator cache — the two caches are independent: `torch.cuda.empty_cache()` does not touch OS page cache, and `posix_fadvise(DONTNEED)` does not touch the CUDA allocator.
 
-`PAGE_CACHE_DROP_TICK` lines appear *during* tensor loading (at each progress tick, ~15s/5GB) for files ≥5GB, using a separate read-only fd with `posix_fadvise(DONTNEED)` to keep OS page cache in check mid-load. This is critical for large models like Flux2.dev (~60GB) where page cache accumulation causes heavy kernel reclaim pressure before the post-load drop fires.
+`PAGE_CACHE_DROP_TICK` lines appear *during* tensor loading (at each progress tick, ~30s/5GB) for files ≥5GB, using a separate read-only fd with `posix_fadvise(DONTNEED)` to keep OS page cache in check mid-load. This is critical for large models like Flux2.dev (~60GB) where page cache accumulation causes heavy kernel reclaim pressure before the post-load drop fires.
 
 ### DGX Spark Unified Memory Context
 On the Spark, "CPU memory" and "GPU memory" are the same 128GB physical pool. The `--unified-memory` flag (auto-detected on GB10/sm_121) enables optimizations that eliminate two of three duplication layers:
