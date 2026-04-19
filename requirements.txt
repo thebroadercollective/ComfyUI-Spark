@@ -7,7 +7,7 @@ torchvision
 torchaudio
 numpy>=1.25.0
 einops
-transformers>=4.50.3
+transformers==4.57.3
 tokenizers>=0.13.3
 sentencepiece
 safetensors>=0.4.2
@@ -27,6 +27,7 @@ comfy-aimdo>=0.2.12
 requests
 simpleeval>=1.0.0
 blake3
+diffusers
 
 #non essential dependencies:
 kornia>=0.7.1
