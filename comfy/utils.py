@@ -120,6 +120,21 @@ def load_safetensors(ckpt):
     return sd, header.get("__metadata__", {}),
 
 
+def _maybe_drop_page_cache(filepath, total_size):
+    """Drop OS page cache for a loaded file (all sizes). No-op on non-Linux or when disabled."""
+    import comfy.model_management
+    if not (args.drop_page_cache or comfy.model_management.UNIFIED_MEMORY):
+        return
+    _pc_before = comfy.model_management.memory_report()
+    if comfy.model_management.drop_file_page_cache(filepath):
+        logging.info(
+            "PAGE_CACHE_DROP file=%s size=%.1fG | %s",
+            os.path.basename(filepath),
+            total_size / (1024 ** 3),
+            comfy.model_management.memory_delta(_pc_before, comfy.model_management.memory_report()),
+        )
+
+
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     explicit_device = device is not None
     if device is None:
@@ -164,53 +179,86 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                 else:
                     load_device = device.type
 
-                with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
-                    sd = {}
-                    tick_enabled = (
-                        logging.getLogger().isEnabledFor(logging.INFO)
-                        and total_size >= 5 * 1024 ** 3
-                    )
-                    bytes_loaded = 0
-                    tensors_loaded = 0
-                    last_tick_time = load_start_time
-                    last_tick_bytes = 0
-                    key_list = list(f.keys())
-                    total_count = len(key_list)
-                    for k in key_list:
-                        tensor = f.get_tensor(k)
-                        if DISABLE_MMAP and not unified:
-                            tensor = tensor.to(device=device, copy=True)
-                        sd[k] = tensor
-                        if tick_enabled:
-                            try:
-                                bytes_loaded += tensor.element_size() * tensor.numel()
-                            except Exception:
-                                pass
-                            tensors_loaded += 1
-                            now = time.perf_counter()
-                            if (now - last_tick_time) >= 2.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                _drop_fd = None
+                # Mid-load drops only for large files (>=5GB) where page cache
+                # accumulation causes kernel reclaim pressure before post-load drop.
+                # Post-load drops (via _maybe_drop_page_cache) cover all file sizes.
+                _mid_load_drop = (
+                    (args.drop_page_cache or unified)
+                    and total_size >= 5 * 1024 ** 3
+                    and hasattr(os, 'posix_fadvise')
+                )
+                try:
+                    if _mid_load_drop:
+                        try:
+                            _drop_fd = os.open(ckpt, os.O_RDONLY)
+                        except OSError:
+                            _mid_load_drop = False
+
+                    with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
+                        sd = {}
+                        tick_enabled = (
+                            logging.getLogger().isEnabledFor(logging.INFO)
+                            and total_size >= 5 * 1024 ** 3
+                        )
+                        bytes_loaded = 0
+                        tensors_loaded = 0
+                        last_tick_time = load_start_time
+                        last_tick_bytes = 0
+                        key_list = list(f.keys())
+                        total_count = len(key_list)
+                        for k in key_list:
+                            tensor = f.get_tensor(k)
+                            if DISABLE_MMAP and not unified:
+                                tensor = tensor.to(device=device, copy=True)
+                            sd[k] = tensor
+                            if tick_enabled:
                                 try:
-                                    sys_avail = psutil.virtual_memory().available / (1024 ** 3)
-                                    sys_avail_str = "{:.1f}G".format(sys_avail)
+                                    bytes_loaded += tensor.element_size() * tensor.numel()
                                 except Exception:
-                                    sys_avail_str = "?G"
-                                pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
-                                logging.info(
-                                    "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
-                                    basename,
-                                    bytes_loaded / (1024 ** 3),
-                                    total_size / (1024 ** 3),
-                                    pct,
-                                    tensors_loaded,
-                                    total_count,
-                                    sys_avail_str,
-                                )
-                                last_tick_time = now
-                                last_tick_bytes = bytes_loaded
-                        else:
-                            tensors_loaded += 1
-                    if return_metadata:
-                        metadata = f.metadata()
+                                    pass
+                                tensors_loaded += 1
+                                now = time.perf_counter()
+                                # 5GB byte threshold is the primary trigger; 30s is a backstop for slow I/O
+                                if (now - last_tick_time) >= 30.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                                    try:
+                                        sys_avail = psutil.virtual_memory().available / (1024 ** 3)
+                                        sys_avail_str = "{:.1f}G".format(sys_avail)
+                                    except Exception:
+                                        sys_avail_str = "?G"
+                                    pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
+                                    logging.info(
+                                        "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
+                                        basename,
+                                        bytes_loaded / (1024 ** 3),
+                                        total_size / (1024 ** 3),
+                                        pct,
+                                        tensors_loaded,
+                                        total_count,
+                                        sys_avail_str,
+                                    )
+                                    if _drop_fd is not None:
+                                        try:
+                                            os.posix_fadvise(_drop_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                                        except OSError:
+                                            pass
+                                        logging.info(
+                                            "  PAGE_CACHE_DROP_TICK file=%s %.1fG/%.1fG (%.0f%%) | sys avail %s",
+                                            basename,
+                                            bytes_loaded / (1024 ** 3),
+                                            total_size / (1024 ** 3),
+                                            pct,
+                                            sys_avail_str,
+                                        )
+                                    last_tick_time = now
+                                    last_tick_bytes = bytes_loaded
+                            else:
+                                tensors_loaded += 1
+                        if return_metadata:
+                            metadata = f.metadata()
+                finally:
+                    if _drop_fd is not None:
+                        os.close(_drop_fd)
 
             metadata_keys = len(metadata) if (return_metadata and metadata is not None) else 0
             elapsed = time.perf_counter() - load_start_time
@@ -221,6 +269,7 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
             )
             import comfy.cache_policy as cache_policy
             cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
+            _maybe_drop_page_cache(ckpt, total_size)
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -266,6 +315,7 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         )
         import comfy.cache_policy as cache_policy
         cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
+        _maybe_drop_page_cache(ckpt, total_size)
     return (sd, metadata) if return_metadata else sd
 
 def save_torch_file(sd, ckpt, metadata=None):

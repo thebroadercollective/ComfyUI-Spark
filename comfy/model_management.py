@@ -483,6 +483,7 @@ if DISABLE_SMART_MEMORY:
 UNIFIED_MEMORY = is_unified_memory_system()
 if UNIFIED_MEMORY:
     logging.info("Unified memory system detected, enabling optimizations")
+    logging.info("Unified memory: page cache drop auto-enabled")
 
 def get_torch_device_name(device):
     if hasattr(device, 'type'):
@@ -1859,6 +1860,19 @@ def soft_empty_cache_unified(force=False):
         # deliberately skip torch.cuda.ipc_collect() on unified memory
     else:
         soft_empty_cache(force=force)
+
+def drop_file_page_cache(filepath: str) -> bool:
+    if not hasattr(os, "posix_fadvise"):
+        return False
+    try:
+        fd = os.open(filepath, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
 
 def _fmt_gb(n_bytes) -> str:
     try:
