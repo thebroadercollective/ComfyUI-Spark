@@ -729,7 +729,14 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     return unloaded_models
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+    _lmg_entry_snap = memory_report()
+    logging.info(
+        "LOAD_MODELS_GPU requested=%s | %s",
+        [type(m.model).__name__ for m in models if hasattr(m, "model")],
+        _lmg_entry_snap,
+    )
     cleanup_models_gc()
+    logging.info("POST_GC | %s", memory_delta(_lmg_entry_snap, memory_report()))
     global vram_state
 
     inference_memory = minimum_inference_memory()
@@ -833,6 +840,12 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        logging.info(
+            "MODEL_GPU_READY %s target=%s | %s",
+            type(loaded_model.model).__name__ if hasattr(loaded_model, "model") else "?",
+            torch_dev,
+            memory_report(),
+        )
         current_loaded_models.insert(0, loaded_model)
     return
 
@@ -1835,6 +1848,73 @@ def soft_empty_cache(force=False):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+def soft_empty_cache_unified(force=False):
+    if is_unified_memory_system() and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        # deliberately skip torch.cuda.ipc_collect() on unified memory
+    else:
+        soft_empty_cache(force=force)
+
+def _fmt_gb(n_bytes) -> str:
+    try:
+        return "{:.1f}G".format(n_bytes / (1024 ** 3))
+    except Exception:
+        return "?G"
+
+def memory_report(*, device=None) -> str:
+    torch_part = None
+    if torch.cuda.is_available():
+        dev = device if device is not None else torch.cuda.current_device()
+        try:
+            alloc = _fmt_gb(torch.cuda.memory_allocated(dev))
+        except Exception:
+            alloc = "?G"
+        try:
+            res = _fmt_gb(torch.cuda.memory_reserved(dev))
+        except Exception:
+            res = "?G"
+        try:
+            free = _fmt_gb(torch.cuda.mem_get_info(dev)[0])
+        except Exception:
+            free = "?G"
+        torch_part = "alloc {} res {} free {}".format(alloc, res, free)
+
+    try:
+        vm = psutil.virtual_memory()
+        sys_avail = _fmt_gb(vm.available)
+        sys_used = _fmt_gb(vm.used)
+    except Exception:
+        sys_avail = sys_used = "?G"
+    sys_part = "sys avail {} used {}".format(sys_avail, sys_used)
+
+    if torch_part is None:
+        return sys_part
+    return "{} | {}".format(torch_part, sys_part)
+
+def _parse_gb_field(text: str, prefix: str) -> float | None:
+    idx = text.find(prefix)
+    if idx < 0:
+        return None
+    rest = text[idx + len(prefix):].lstrip()
+    end = rest.find("G")
+    if end < 0:
+        return None
+    token = rest[:end]
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+def memory_delta(before: str, after: str) -> str:
+    b_alloc = _parse_gb_field(before, "alloc ")
+    a_alloc = _parse_gb_field(after, "alloc ")
+    b_sys = _parse_gb_field(before, "sys avail ")
+    a_sys = _parse_gb_field(after, "sys avail ")
+    if None in (b_alloc, a_alloc, b_sys, a_sys):
+        return "Δtorch ?G Δavail ?G"
+    return "Δtorch {:+.1f}G Δavail {:+.1f}G".format(a_alloc - b_alloc, a_sys - b_sys)
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())

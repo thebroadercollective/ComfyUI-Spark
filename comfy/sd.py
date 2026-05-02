@@ -1661,7 +1661,22 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
 
     return (model, clip, vae)
 
+def _dtype_to_bytes(dtype):
+    if dtype is None:
+        return 0
+    try:
+        return torch.empty(0, dtype=dtype).element_size()
+    except Exception:
+        return 0
+
+
 def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, disable_dynamic=False):
+    _ckpt_basename = os.path.basename(ckpt_path)
+    checkpoint_start_snap = model_management.memory_report()
+    logging.info(
+        "CHECKPOINT %s -> load_state_dict_guess_config | %s",
+        _ckpt_basename, checkpoint_start_snap,
+    )
     sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
     out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata, disable_dynamic=disable_dynamic)
     if out is None:
@@ -1670,6 +1685,11 @@ def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, o
         out[0].cached_patcher_init = (load_checkpoint_guess_config_model_only, (ckpt_path, embedding_directory, model_options, te_model_options))
     if output_clip and out[1] is not None:
         out[1].patcher.cached_patcher_init = (load_checkpoint_guess_config_clip_only, (ckpt_path, embedding_directory, model_options, te_model_options))
+    logging.info(
+        "CHECKPOINT done %s | %s",
+        _ckpt_basename,
+        model_management.memory_delta(checkpoint_start_snap, model_management.memory_report()),
+    )
     return out
 
 def load_checkpoint_guess_config_model_only(ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
@@ -1689,6 +1709,8 @@ def load_checkpoint_guess_config_clip_only(ckpt_path, embedding_directory=None, 
     return clip.patcher
 
 def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, metadata=None, disable_dynamic=False):
+    slice_start = model_management.memory_report()
+    logging.info("CHECKPOINT_SLICE entry | %s", slice_start)
     clip = None
     clipvision = None
     vae = None
@@ -1700,6 +1722,14 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     weight_dtype = comfy.utils.weight_dtype(sd, diffusion_model_prefix)
     load_device = model_management.get_torch_device()
 
+    # Capture component byte sizes before the state dict is partitioned/drained.
+    try:
+        _unet_bytes = parameters * _dtype_to_bytes(weight_dtype)
+    except Exception:
+        _unet_bytes = 0
+    _vae_bytes = 0
+    _clip_bytes = 0
+
     custom_operations = model_options.get("custom_operations", None)
     if custom_operations is None:
         sd, metadata = comfy.utils.convert_old_quants(sd, diffusion_model_prefix, metadata=metadata)
@@ -1707,10 +1737,33 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix, metadata=metadata)
     if model_config is None:
         logging.warning("Warning, This is not a checkpoint file, trying to load it as a diffusion model only.")
+        logging.info("CHECKPOINT_SLICE done (fallback) | %s",
+                     model_management.memory_delta(slice_start, model_management.memory_report()))
         diffusion_model = load_diffusion_model_state_dict(sd, model_options={})
         if diffusion_model is None:
             return None
         return (diffusion_model, None, VAE(sd={}), None)  # The VAE object is there to throw an exception if it's actually used'
+
+    logging.info(
+        "DETECTED model_config=%s params=%.1fB weight_dtype=%s",
+        model_config.__class__.__name__, parameters / 1e9, weight_dtype,
+    )
+
+    try:
+        _vae_bytes = sum(
+            comfy.utils.calculate_parameters(sd, p) * _dtype_to_bytes(comfy.utils.weight_dtype(sd, p))
+            for p in model_config.vae_key_prefix
+        )
+    except Exception:
+        _vae_bytes = 0
+
+    try:
+        _clip_bytes = sum(
+            comfy.utils.calculate_parameters(sd, p) * _dtype_to_bytes(comfy.utils.weight_dtype(sd, p))
+            for p in model_config.text_encoder_key_prefix
+        )
+    except Exception:
+        _clip_bytes = 0
 
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
     if model_config.quant_config is not None:
@@ -1736,17 +1789,35 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
 
     if output_model:
         inital_load_device = model_management.unet_inital_load_device(parameters, unet_dtype)
+        model_init_before = model_management.memory_report()
         model = model_config.get_model(sd, diffusion_model_prefix, device=inital_load_device)
+        logging.info(
+            "MODEL_INIT allocated %s on %s | %s",
+            model.__class__.__name__, inital_load_device,
+            model_management.memory_delta(model_init_before, model_management.memory_report()),
+        )
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device())
+        unet_load_before = model_management.memory_report()
         model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.should_assign_weights())
+        logging.info(
+            "UNET_LOADED assign=%s | %s",
+            model_patcher.should_assign_weights(),
+            model_management.memory_delta(unet_load_before, model_management.memory_report()),
+        )
 
     if output_vae:
+        vae_before = model_management.memory_report()
         vae_sd = comfy.utils.state_dict_prefix_replace(sd, {k: "" for k in model_config.vae_key_prefix}, filter_keys=True)
         vae_sd = model_config.process_vae_state_dict(vae_sd)
         vae = VAE(sd=vae_sd, metadata=metadata)
+        logging.info(
+            "VAE_LOADED | %s",
+            model_management.memory_delta(vae_before, model_management.memory_report()),
+        )
 
     if output_clip:
+        clip_before = model_management.memory_report()
         if te_model_options.get("custom_operations", None) is None:
             scaled_fp8_list = []
             for k in list(sd.keys()):  # Convert scaled fp8 to mixed ops
@@ -1776,6 +1847,17 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
                 clip = CLIP(clip_target, embedding_directory=embedding_directory, tokenizer_data=clip_sd, parameters=parameters, state_dict=clip_sd, model_options=te_model_options, disable_dynamic=disable_dynamic)
             else:
                 logging.warning("no CLIP/text encoder weights in checkpoint, the text encoder model will not be loaded.")
+        if clip is not None:
+            _clip_target_name = getattr(clip_target, "clip", None)
+            if _clip_target_name is None:
+                _clip_target_name = type(clip_target).__name__ if clip_target is not None else "None"
+            else:
+                _clip_target_name = getattr(_clip_target_name, "__name__", str(_clip_target_name))
+            logging.info(
+                "CLIP_LOADED target=%s | %s",
+                _clip_target_name,
+                model_management.memory_delta(clip_before, model_management.memory_report()),
+            )
 
     left_over = sd.keys()
     if len(left_over) > 0:
@@ -1786,6 +1868,11 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
             logging.info("loaded diffusion model directly to GPU")
             model_management.load_models_gpu([model_patcher], force_full_load=True)
 
+    logging.info(
+        "CHECKPOINT_SLICE done unet=%.1fG vae=%.1fG clip=%.1fG | %s",
+        _unet_bytes / (1024 ** 3), _vae_bytes / (1024 ** 3), _clip_bytes / (1024 ** 3),
+        model_management.memory_delta(slice_start, model_management.memory_report()),
+    )
     return (model_patcher, clip, vae, clipvision)
 
 
@@ -1811,6 +1898,8 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     4. Manages model optimization settings
     5. Loads weights and returns a device-managed model instance
     """
+    _diffusion_start = model_management.memory_report()
+    logging.info("DIFFUSION_MODEL entry | %s", _diffusion_start)
     dtype = model_options.get("dtype", None)
 
     custom_operations = model_options.get("custom_operations", None)
@@ -1884,6 +1973,10 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
+    logging.info(
+        "DIFFUSION_MODEL done | %s",
+        model_management.memory_delta(_diffusion_start, model_management.memory_report()),
+    )
     return model_patcher
 
 def load_diffusion_model(unet_path, model_options={}, disable_dynamic=False):
