@@ -24,3 +24,8 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+.worktrees/
+.claude/
+SageAttention/
+pyproject.toml.old
+x_models/
