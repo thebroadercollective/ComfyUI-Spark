@@ -120,21 +120,30 @@ def load_safetensors(ckpt):
 
 
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+    explicit_device = device is not None
     if device is None:
         device = torch.device("cpu")
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+        import comfy.model_management
         try:
             if comfy.memory_management.aimdo_enabled:
                 sd, metadata = load_safetensors(ckpt)
                 if not return_metadata:
                     metadata = None
             else:
-                with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+                unified = comfy.model_management.UNIFIED_MEMORY
+                if unified and not explicit_device:
+                    load_device = "cuda"
+                    logging.debug("Unified memory: loading %s directly to CUDA", os.path.basename(ckpt))
+                else:
+                    load_device = device.type
+
+                with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
                     sd = {}
                     for k in f.keys():
                         tensor = f.get_tensor(k)
-                        if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
+                        if DISABLE_MMAP and not unified:
                             tensor = tensor.to(device=device, copy=True)
                         sd[k] = tensor
                     if return_metadata:

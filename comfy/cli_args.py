@@ -83,6 +83,8 @@ fpte_group.add_argument("--fp16-text-enc", action="store_true", help="Store text
 fpte_group.add_argument("--fp32-text-enc", action="store_true", help="Store text encoder weights in fp32.")
 fpte_group.add_argument("--bf16-text-enc", action="store_true", help="Store text encoder weights in bf16.")
 
+parser.add_argument("--cpu-text-enc", action="store_true", help="Load text encoders on the CPU. Useful on unified memory systems to avoid CUDA allocator OOM during loading.")
+
 parser.add_argument("--fp16-intermediates", action="store_true", help="Experimental: Use fp16 for intermediate tensors between nodes instead of fp32.")
 
 parser.add_argument("--force-channels-last", action="store_true", help="Force channels last format when inferencing the models.")
@@ -172,6 +174,7 @@ parser.add_argument("--disable-pinned-memory", action="store_true", help="Disabl
 
 parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap when loading ckpt/pt files.")
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors.")
+parser.add_argument("--unified-memory", action="store_true", help="Enable unified memory optimizations for systems where CPU and GPU share memory (e.g., NVIDIA DGX Spark).")
 
 parser.add_argument("--dont-print-server", action="store_true", help="Don't print server output.")
 parser.add_argument("--quick-test-for-ci", action="store_true", help="Quick test for CI.")
