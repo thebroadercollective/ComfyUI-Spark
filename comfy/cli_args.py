@@ -160,6 +160,74 @@ parser.add_argument("--force-non-blocking", action="store_true", help="Force Com
 parser.add_argument("--default-hashing-function", type=str, choices=['md5', 'sha1', 'sha256', 'sha512'], default='sha256', help="Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.")
 
 parser.add_argument("--disable-smart-memory", action="store_true", help="Force ComfyUI to agressively offload to regular ram instead of keeping models in vram when it can.")
+
+# Duplicated here (rather than imported from comfy.cache_policy) to avoid a
+# circular import: cache_policy imports `args` from this module. A drift
+# assertion in cache_policy re-anchors this list against the CachePhase enum
+# at import time, so any future divergence fails fast at startup.
+_VALID_CACHE_PHASES = frozenset({
+    "pre_checkpoint_load",
+    "post_file_load",
+    "post_checkpoint_slice",
+    "post_model_init",
+    "post_checkpoint_load",
+    "pre_inference",
+    "post_inference",
+})
+
+
+def _cache_drop_at_type(raw: str) -> str:
+    """argparse type= validator for --cache-drop-at.
+
+    Fails fast at argparse time on unknown phase names so users see a clear
+    CLI error instead of a silent degradation log from inside the runtime
+    error-swallowing wrapper in cache_policy.maybe_drop().
+
+    Returns the raw string unchanged; cache_policy._parse_phase_override
+    still does the string-to-enum parse at runtime.
+    """
+    names = [s.strip() for s in raw.split(",") if s.strip()]
+    unknown = [n for n in names if n.lower() not in _VALID_CACHE_PHASES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown cache phase(s): {unknown}. "
+            f"Valid phases: {sorted(_VALID_CACHE_PHASES)}"
+        )
+    return raw
+
+
+parser.add_argument(
+    "--cache-aggressiveness",
+    type=str,
+    choices=["off", "low", "normal", "high", "paranoid"],
+    default="normal",
+    help="Cache drop aggressiveness preset for the model loader. off = no drops; "
+         "low = one drop at checkpoint-load; normal = drops at checkpoint-load and "
+         "pre-inference (default); high = adds post-file-load and post-model-init; "
+         "paranoid = every phase (debugging only, slow).",
+)
+
+parser.add_argument(
+    "--cache-drop-at",
+    type=_cache_drop_at_type,
+    default=None,
+    metavar="PHASE[,PHASE...]",
+    help="Explicit comma-separated list of cache phases to drop at, overriding "
+         "--cache-aggressiveness. Valid phases: pre_checkpoint_load, post_file_load, "
+         "post_checkpoint_slice, post_model_init, post_checkpoint_load, pre_inference, "
+         "post_inference. Every phase in the override list also triggers gc.collect().",
+)
+
+parser.add_argument(
+    "--cache-drop-threshold-gb",
+    type=float,
+    default=None,
+    metavar="GB",
+    help="Memory-pressure watermark: drop caches (with gc.collect) at any phase "
+         "hook when psutil.virtual_memory().available falls below this threshold. "
+         "Orthogonal to --cache-aggressiveness. Default: unset (watermark inactive).",
+)
+
 parser.add_argument("--deterministic", action="store_true", help="Make pytorch use slower deterministic algorithms when it can. Note that this might not make images deterministic in all cases.")
 
 class PerformanceFeature(enum.Enum):

@@ -219,6 +219,8 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                 basename, elapsed, tensors_loaded, metadata_keys,
                 comfy.model_management.memory_delta(load_start_snap, comfy.model_management.memory_report()),
             )
+            import comfy.cache_policy as cache_policy
+            cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -262,6 +264,8 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
             basename, elapsed, tensors_loaded,
             comfy.model_management.memory_delta(load_start_snap, comfy.model_management.memory_report()),
         )
+        import comfy.cache_policy as cache_policy
+        cache_policy.maybe_drop(cache_policy.CachePhase.POST_FILE_LOAD, reason=basename)
     return (sd, metadata) if return_metadata else sd
 
 def save_torch_file(sd, ckpt, metadata=None):
