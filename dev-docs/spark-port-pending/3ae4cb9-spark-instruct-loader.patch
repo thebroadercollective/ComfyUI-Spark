@@ -1,0 +1,397 @@
+From 3ae4cb9b2d5c187267eed1669f37c4d134738874 Mon Sep 17 00:00:00 2001
+From: DGX Spark Dev <dev@dgx-spark.local>
+Date: Sun, 12 Apr 2026 19:31:44 -0400
+Subject: [PATCH] feat(loader): add DGX Spark unified memory optimizations to
+ Instruct loader
+
+Add background page cache dropper during from_pretrained() that periodically
+drops OS page cache for safetensors shards every 30s, preventing ~83GB of
+mmap'd page cache from accumulating on unified memory systems. Replace manual
+time.sleep(15) hack with programmatic page cache management. Replace raw
+torch.cuda.empty_cache() with soft_empty_cache_unified() and add memory
+observability via memory_report()/memory_delta().
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ hunyuan_instruct_nodes.py | 278 +++++++++++++++++++++++++-------------
+ 1 file changed, 187 insertions(+), 91 deletions(-)
+
+diff --git a/hunyuan_instruct_nodes.py b/hunyuan_instruct_nodes.py
+index f7140e8..ed3e6de 100644
+--- a/hunyuan_instruct_nodes.py
++++ b/hunyuan_instruct_nodes.py
+@@ -15,10 +15,13 @@ Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
+ """
+ 
+ import gc
++import glob
+ import logging
+ import os
+ import tempfile
++import threading
+ import time
++from contextlib import contextmanager
+ from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ import numpy as np
+@@ -172,6 +175,83 @@ INSTRUCT_RESOLUTION_PRESETS = {
+ RESOLUTION_LIST = list(INSTRUCT_RESOLUTION_PRESETS.keys())
+ 
+ 
++# =============================================================================
++# DGX Spark Unified Memory Helpers
++# =============================================================================
++
++def _is_unified_memory() -> bool:
++    """Check if running on a unified memory system (DGX Spark)."""
++    try:
++        import comfy.model_management as model_management
++        return getattr(model_management, "UNIFIED_MEMORY", False)
++    except ImportError:
++        return False
++
++
++def _page_cache_dropper(safetensors_files, stop_event, interval=30):
++    """Background thread: drop OS page cache for safetensors files periodically.
++
++    On unified memory, mmap'd page cache competes with CUDA allocations for the
++    same physical pool. Dropping it mid-load keeps peak memory lower.
++    """
++    try:
++        import comfy.model_management as model_management
++    except ImportError:
++        return
++    while not stop_event.wait(interval):
++        dropped = 0
++        for path in safetensors_files:
++            if model_management.drop_file_page_cache(path):
++                dropped += 1
++        if dropped:
++            logger.info("PAGE_CACHE_DROP_TICK | dropped %d shards", dropped)
++
++
++@contextmanager
++def _mid_load_page_cache_drop(model_path):
++    """Drop page cache periodically during from_pretrained() on unified memory.
++
++    Wraps a from_pretrained() call with a background thread that drops OS page
++    cache for all safetensors shards every 30 seconds, plus a final sweep after
++    loading completes. No-op on non-unified-memory systems.
++    """
++    if not _is_unified_memory():
++        yield
++        return
++
++    try:
++        import comfy.model_management as model_management
++    except ImportError:
++        yield
++        return
++
++    safetensors_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
++    if not safetensors_files:
++        yield
++        return
++
++    logger.info("PAGE_CACHE_DROP | starting background dropper for %d shards", len(safetensors_files))
++    stop_event = threading.Event()
++    dropper = threading.Thread(
++        target=_page_cache_dropper,
++        args=(safetensors_files, stop_event),
++        daemon=True,
++    )
++    dropper.start()
++    try:
++        yield
++    finally:
++        stop_event.set()
++        dropper.join(timeout=5)
++        # Final sweep to catch any remaining page cache
++        dropped = 0
++        for path in safetensors_files:
++            if model_management.drop_file_page_cache(path):
++                dropped += 1
++        if dropped:
++            logger.info("PAGE_CACHE_DROP | final sweep, %d shards", dropped)
++
++
+ # =============================================================================
+ # GPU Memory Utilities
+ # =============================================================================
+@@ -1538,19 +1618,21 @@ class HunyuanInstructLoader:
+             gc.collect()
+             gc.collect()
+             gc.collect()
+-            
+-            if torch.cuda.is_available():
++
++            if COMFYUI_AVAILABLE:
++                mm.soft_empty_cache_unified()
++            elif torch.cuda.is_available():
+                 torch.cuda.empty_cache()
+-                torch.cuda.synchronize()
+-            
++
+             # Step 3: Final gc (orphan hunt removed — it was destroying
+             # other models' parameters across the process)
+             gc.collect()
+             gc.collect()
+-            
+-            if torch.cuda.is_available():
++
++            if COMFYUI_AVAILABLE:
++                mm.soft_empty_cache_unified()
++            elif torch.cuda.is_available():
+                 torch.cuda.empty_cache()
+-                torch.cuda.synchronize()
+             
+             # Force Windows to return freed memory to OS
+             try:
+@@ -1614,28 +1696,31 @@ class HunyuanInstructLoader:
+         
+         # Clear VRAM before loading
+         gc.collect()
+-        if torch.cuda.is_available():
++        if COMFYUI_AVAILABLE:
++            mm.soft_empty_cache_unified()
++        elif torch.cuda.is_available():
+             torch.cuda.empty_cache()
+-            torch.cuda.synchronize()
+-        
++
+         # Load model with type-specific strategy
++        _mem_before = mm.memory_report() if COMFYUI_AVAILABLE else None
+         start_time = time.time()
+         
+         if quant_type == "nf4":
+             # NF4 pre-quantized models: load to single GPU, no quantization_config needed
+             # These models are small enough (~24GB) to fit on one GPU
+             logger.info("Loading pre-quantized NF4 Instruct model to single GPU...")
+-            model = AutoModelForCausalLM.from_pretrained(
+-                model_path,
+-                device_map={"": "cuda:0"},  # Single GPU, moveable
+-                trust_remote_code=True,
+-                torch_dtype=torch.bfloat16,
+-                attn_implementation=attention_impl,
+-                moe_impl=moe_impl,
+-                moe_drop_tokens=True,
+-                low_cpu_mem_usage=True,
+-                # No quantization_config - model is pre-quantized on disk
+-            )
++            with _mid_load_page_cache_drop(model_path):
++                model = AutoModelForCausalLM.from_pretrained(
++                    model_path,
++                    device_map={"": "cuda:0"},  # Single GPU, moveable
++                    trust_remote_code=True,
++                    torch_dtype=torch.bfloat16,
++                    attn_implementation=attention_impl,
++                    moe_impl=moe_impl,
++                    moe_drop_tokens=True,
++                    low_cpu_mem_usage=True,
++                    # No quantization_config - model is pre-quantized on disk
++                )
+             model_info["is_moveable"] = True
+             
+         elif quant_type == "int8":
+@@ -1649,16 +1734,17 @@ class HunyuanInstructLoader:
+                 # which conflicts with our block swap hooks.
+                 # Int8Params.to(device) fully supports GPU↔CPU movement.
+                 logger.info(f"  Block swap mode: loading INT8 model to CPU first...")
+-                model = AutoModelForCausalLM.from_pretrained(
+-                    model_path,
+-                    device_map="cpu",
+-                    trust_remote_code=True,
+-                    torch_dtype=torch.bfloat16,
+-                    attn_implementation=attention_impl,
+-                    moe_impl=moe_impl,
+-                    moe_drop_tokens=True,
+-                    low_cpu_mem_usage=True,
+-                )
++                with _mid_load_page_cache_drop(model_path):
++                    model = AutoModelForCausalLM.from_pretrained(
++                        model_path,
++                        device_map="cpu",
++                        trust_remote_code=True,
++                        torch_dtype=torch.bfloat16,
++                        attn_implementation=attention_impl,
++                        moe_impl=moe_impl,
++                        moe_drop_tokens=True,
++                        low_cpu_mem_usage=True,
++                    )
+                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
+                 logger.info("  Moving non-block components to GPU...")
+                 _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+@@ -1707,32 +1793,35 @@ class HunyuanInstructLoader:
+                     # Model fits on single GPU with good headroom — best case.
+                     logger.info(f"  INT8 fits on single GPU with {headroom_after_load:.1f}GB "
+                                f"headroom (>= {vram_reserve_gb:.1f}GB reserve). Using direct placement.")
+-                    model = AutoModelForCausalLM.from_pretrained(
+-                        model_path,
+-                        device_map="cuda:0",
+-                        trust_remote_code=True,
+-                        torch_dtype=torch.bfloat16,
+-                        attn_implementation=attention_impl,
+-                        moe_impl=moe_impl,
+-                        moe_drop_tokens=True,
+-                        low_cpu_mem_usage=True,
+-                    )
++
++                    with _mid_load_page_cache_drop(model_path):
++                        model = AutoModelForCausalLM.from_pretrained(
++                            model_path,
++                            device_map="cuda:0",
++                            trust_remote_code=True,
++                            torch_dtype=torch.bfloat16,
++                            attn_implementation=attention_impl,
++                            moe_impl=moe_impl,
++                            moe_drop_tokens=True,
++                            low_cpu_mem_usage=True,
++                        )
+                 elif headroom_after_load > 0:
+                     # Model fits on single GPU but headroom is tight.
+                     # Still use single GPU because dispatch_mask must be on GPU 0.
+                     logger.info(f"  INT8 fits on single GPU with {headroom_after_load:.1f}GB "
+                                f"headroom (< {vram_reserve_gb:.1f}GB reserve, but single-GPU is optimal). "
+                                f"Consider using blocks_to_swap to free more VRAM if OOM occurs.")
+-                    model = AutoModelForCausalLM.from_pretrained(
+-                        model_path,
+-                        device_map="cuda:0",
+-                        trust_remote_code=True,
+-                        torch_dtype=torch.bfloat16,
+-                        attn_implementation=attention_impl,
+-                        moe_impl=moe_impl,
+-                        moe_drop_tokens=True,
+-                        low_cpu_mem_usage=True,
+-                    )
++                    with _mid_load_page_cache_drop(model_path):
++                        model = AutoModelForCausalLM.from_pretrained(
++                            model_path,
++                            device_map="cuda:0",
++                            trust_remote_code=True,
++                            torch_dtype=torch.bfloat16,
++                            attn_implementation=attention_impl,
++                            moe_impl=moe_impl,
++                            moe_drop_tokens=True,
++                            low_cpu_mem_usage=True,
++                        )
+                 else:
+                     # Model doesn't fit on primary GPU.
+                     # Use create_device_map_for_instruct() which puts ALL transformer
+@@ -1764,17 +1853,18 @@ class HunyuanInstructLoader:
+                     max_memory.pop("cpu", None)
+                     max_memory["cpu"] = "0GiB"
+                     
+-                    model = AutoModelForCausalLM.from_pretrained(
+-                        model_path,
+-                        device_map=explicit_map,
+-                        max_memory=max_memory,
+-                        trust_remote_code=True,
+-                        torch_dtype=torch.bfloat16,
+-                        attn_implementation=attention_impl,
+-                        moe_impl=moe_impl,
+-                        moe_drop_tokens=True,
+-                        low_cpu_mem_usage=True,
+-                    )
++                    with _mid_load_page_cache_drop(model_path):
++                        model = AutoModelForCausalLM.from_pretrained(
++                            model_path,
++                            device_map=explicit_map,
++                            max_memory=max_memory,
++                            trust_remote_code=True,
++                            torch_dtype=torch.bfloat16,
++                            attn_implementation=attention_impl,
++                            moe_impl=moe_impl,
++                            moe_drop_tokens=True,
++                            low_cpu_mem_usage=True,
++                        )
+                 model_info["is_moveable"] = False
+             
+         else:
+@@ -1789,16 +1879,17 @@ class HunyuanInstructLoader:
+                 # leaving ~46GB free for inference on a 96GB card.
+                 logger.info("Loading BF16 Instruct model to CPU for block swap...")
+                 logger.info(f"  Block swap: {blocks_to_swap} blocks will be managed on CPU")
+-                model = AutoModelForCausalLM.from_pretrained(
+-                    model_path,
+-                    attn_implementation=attention_impl,
+-                    trust_remote_code=True,
+-                    torch_dtype=torch.bfloat16,
+-                    device_map="cpu",
+-                    low_cpu_mem_usage=True,
+-                    moe_impl=moe_impl,
+-                    moe_drop_tokens=True,
+-                )
++                with _mid_load_page_cache_drop(model_path):
++                    model = AutoModelForCausalLM.from_pretrained(
++                        model_path,
++                        attn_implementation=attention_impl,
++                        trust_remote_code=True,
++                        torch_dtype=torch.bfloat16,
++                        device_map="cpu",
++                        low_cpu_mem_usage=True,
++                        moe_impl=moe_impl,
++                        moe_drop_tokens=True,
++                    )
+                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
+                 logger.info("  Moving non-block components to GPU...")
+                 _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+@@ -1814,16 +1905,17 @@ class HunyuanInstructLoader:
+                     reserve_min_gb=vram_reserve_gb,
+                     model_size_gb=160.0,  # BF16 model is ~160GB
+                 )
+-                model = AutoModelForCausalLM.from_pretrained(
+-                    model_path,
+-                    attn_implementation=attention_impl,
+-                    trust_remote_code=True,
+-                    torch_dtype=torch.bfloat16,
+-                    device_map=explicit_map,
+-                    max_memory=max_memory,
+-                    moe_impl=moe_impl,
+-                    moe_drop_tokens=True,
+-                )
++                with _mid_load_page_cache_drop(model_path):
++                    model = AutoModelForCausalLM.from_pretrained(
++                        model_path,
++                        attn_implementation=attention_impl,
++                        trust_remote_code=True,
++                        torch_dtype=torch.bfloat16,
++                        device_map=explicit_map,
++                        max_memory=max_memory,
++                        moe_impl=moe_impl,
++                        moe_drop_tokens=True,
++                    )
+                 model_info["is_moveable"] = False
+         
+         # Log actual device placement
+@@ -1932,15 +2024,19 @@ class HunyuanInstructLoader:
+                 logger.warning(f"  Device diagnostic failed: {e}")
+         
+         elapsed = time.time() - start_time
+-        logger.info(f"Model loaded in {elapsed:.1f}s")
+-        
+-        # Log memory usage across all GPUs
+-        if torch.cuda.is_available():
+-            for i in range(torch.cuda.device_count()):
+-                allocated = torch.cuda.memory_allocated(i) / 1024**3
+-                if allocated > 0.1:
+-                    free_bytes, _ = torch.cuda.mem_get_info(i)
+-                    logger.info(f"GPU {i}: {allocated:.1f}GB allocated, {free_bytes/1024**3:.1f}GB free")
++        _mem_after = mm.memory_report() if COMFYUI_AVAILABLE else None
++        if _mem_before and _mem_after:
++            logger.info(f"HUNYUAN_LOAD | done in {elapsed:.1f}s | {mm.memory_delta(_mem_before, _mem_after)}")
++            logger.info(f"HUNYUAN_LOAD | {_mem_after}")
++        else:
++            logger.info(f"Model loaded in {elapsed:.1f}s")
++            # Fallback: log memory usage across all GPUs
++            if torch.cuda.is_available():
++                for i in range(torch.cuda.device_count()):
++                    allocated = torch.cuda.memory_allocated(i) / 1024**3
++                    if allocated > 0.1:
++                        free_bytes, _ = torch.cuda.mem_get_info(i)
++                        logger.info(f"GPU {i}: {allocated:.1f}GB allocated, {free_bytes/1024**3:.1f}GB free")
+         
+         # Attach model info for downstream nodes
+         model._hunyuan_info = model_info
+-- 
+2.43.0
+
