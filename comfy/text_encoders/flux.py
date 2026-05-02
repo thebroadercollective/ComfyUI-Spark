@@ -73,7 +73,9 @@ def flux_clip(dtype_t5=None, t5_quantization_metadata=None):
 
 def load_mistral_tokenizer(data):
     if torch.is_tensor(data):
-        data = data.numpy().tobytes()
+        # SPARK: .cpu() first — on unified memory safe_open(device="cuda") puts the
+        # tokenizer vocab tensor on CUDA, and .numpy() fails on a CUDA tensor.
+        data = data.cpu().numpy().tobytes()
     return {"tokenizer_object": from_tekken_json(data)}
 
 

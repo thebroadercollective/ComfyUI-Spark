@@ -112,7 +112,7 @@ class HunyuanVideo15SRModel():
         self.patcher = comfy.model_patcher.CoreModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=True, assign=self.patcher.is_dynamic())
+        return self.model.load_state_dict(sd, strict=True, assign=self.patcher.should_assign_weights())
 
     def get_sd(self):
         return self.model.state_dict()

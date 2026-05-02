@@ -57,7 +57,7 @@ class ClipVisionModel():
         self.naf = None
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
 
     def get_sd(self):
         return self.model.state_dict()

@@ -30,7 +30,7 @@ class AudioEncoderModel():
         comfy.model_management.archive_model_dtypes(self.model)
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
 
     def get_sd(self):
         return self.model.state_dict()
