@@ -4,22 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ComfyUI-Spark is a fork of [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (v0.18.1) optimized for the NVIDIA DGX Spark (GB10, sm_121, 128GB unified LPDDR5x memory). The core optimization goal is eliminating redundant memory copies during model loading — on unified memory, the standard ComfyUI loading pipeline creates 2-3x memory usage because it assumes separate RAM/VRAM pools.
+ComfyUI-Spark is a fork of [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (v0.22.0) optimized for the NVIDIA DGX Spark (GB10, sm_121, 128GB unified LPDDR5x memory). The core optimization goal is eliminating redundant memory copies during model loading — on unified memory, the standard ComfyUI loading pipeline creates 2-3x memory usage because it assumes separate RAM/VRAM pools.
 
 ## Common Commands
 
 ```bash
-# Run ComfyUI (DGX Spark optimized flags)
-uv run python main.py --listen 0.0.0.0 \
+# Run ComfyUI (DGX Spark optimized flags). --disable-mmap is NOT used: GB10
+# autodetection routes loads directly to CUDA, making it irrelevant/unnecessary.
+# --cpu-text-enc loads the text encoder on CPU — needed for large models (Flux2.dev).
+# CUDA_CACHE_MAXSIZE=4GiB enlarges the JIT kernel cache to avoid recompiles.
+CUDA_CACHE_MAXSIZE=4294967296 python main.py --listen 0.0.0.0 --port 8188 \
   --disable-dynamic-vram --reserve-vram 1 --disable-pinned-memory \
-  --disable-mmap --dont-upcast-attention \
-  --bf16-unet --bf16-vae --bf16-text-enc
-
-# Run with CPU text encoder loading (needed for large models like Flux2.dev)
-uv run python main.py --listen 0.0.0.0 \
-  --disable-dynamic-vram --reserve-vram 1 --disable-pinned-memory \
-  --disable-mmap --dont-upcast-attention \
-  --bf16-unet --bf16-vae --bf16-text-enc --cpu-text-enc
+  --bf16-unet --bf16-vae --bf16-text-enc \
+  --use-sage-attention --cpu-text-enc --verbose INFO --cache-aggressiveness high
 
 # Lint (ruff is configured in pyproject.toml but is NOT a pinned dependency;
 # `uv run ruff` fails after a dep resync — use uvx to fetch it ephemerally)
@@ -54,13 +51,13 @@ uv sync
 ### Core Model Pipeline (`comfy/`)
 The model loading and inference pipeline flows through these key files:
 
-- **`comfy/cli_args.py`** — All CLI flags parsed here. Memory-relevant flags: `--disable-mmap`, `--disable-pinned-memory`, `--disable-dynamic-vram`, `--reserve-vram`, `--bf16-unet/vae/text-enc`, `--cpu-text-enc`, `--highvram`, `--gpu-only`, `--lowvram`, `--novram`.
+- **`comfy/cli_args.py`** — All CLI flags parsed here. Memory-relevant flags: `--disable-mmap` (do NOT add to the launch command: irrelevant on GB10 — autodetection already routes loads directly to CUDA), `--disable-pinned-memory`, `--disable-dynamic-vram`, `--reserve-vram`, `--bf16-unet/vae/text-enc`, `--cpu-text-enc`, `--highvram`, `--gpu-only`, `--lowvram`, `--novram`.
 - **`comfy/cache_policy.py`** — Configurable cache-drop policy for model loading. `CachePhase` enum defines seven load-path phase hooks. `maybe_drop(phase)` checks the active preset/override/watermark and calls `soft_empty_cache_unified()` + optional `gc.collect()`. CLI flags: `--cache-aggressiveness {off,low,normal,high,paranoid}` (default: normal), `--cache-drop-at <phases>` (comma-separated override), `--cache-drop-threshold-gb <gb>` (pressure watermark). Call sites are in `sd.py`, `utils.py`, `model_management.py`. The module imports `model_management` at module level (safe: one-way dependency) and `cli_args.args`.
-- **`comfy/model_management.py`** (~1800 lines) — Central memory management. Controls VRAM state (HIGH/NORMAL/LOW/NO/SHARED), model loading/unloading between CPU and GPU, memory estimation, and the soft/hard memory limits that trigger offloading. The `VRAMState` enum and `load_models_gpu()` function are critical. Contains memory observability helpers: `memory_report(*, device=None) -> str` returns `"alloc X.XG res X.XG free X.XG | sys avail X.XG used X.XG"` combining torch allocator + psutil views; `memory_delta(before, after) -> str` returns `"Δtorch +X.XG Δavail +X.XG"` from two snapshot strings; `soft_empty_cache_unified(force=False)` skips `ipc_collect()` on unified memory. Use these for any new load-path logging.
-- **`comfy/model_patcher.py`** (~1700 lines) — `ModelPatcher` wraps loaded models, handles weight patching (LoRA, etc.), device movement, and memory tracking. `patch_model()` / `unpatch_model()` manage weight modifications.
-- **`comfy/sd.py`** (~1850 lines) — High-level model loading. `load_diffusion_model()`, `load_clip()`, `load_vae()` orchestrate loading safetensors files into model architectures. Uses `comfy.utils.load_torch_file()` for the actual file I/O.
-- **`comfy/utils.py`** (~1450 lines) — `load_torch_file()` is the universal file loading function. For safetensors, it uses `safetensors.safe_open()` with mmap. When `--disable-mmap` is set, it does `tensor.to(device=device, copy=True)` which forces a duplicate on unified memory.
-- **`comfy/ops.py`** (~1200 lines) — Custom PyTorch module wrappers (`Linear`, `Conv2d`, etc.) that handle dtype casting and device placement during inference.
+- **`comfy/model_management.py`** (~2150 lines) — Central memory management. Controls VRAM state (HIGH/NORMAL/LOW/NO/SHARED), model loading/unloading between CPU and GPU, memory estimation, and the soft/hard memory limits that trigger offloading. The `VRAMState` enum and `load_models_gpu()` function are critical. Contains memory observability helpers: `memory_report(*, device=None) -> str` returns `"alloc X.XG res X.XG free X.XG | sys avail X.XG used X.XG"` combining torch allocator + psutil views; `memory_delta(before, after) -> str` returns `"Δtorch +X.XG Δavail +X.XG"` from two snapshot strings; `soft_empty_cache_unified(force=False)` skips `ipc_collect()` on unified memory. Use these for any new load-path logging.
+- **`comfy/model_patcher.py`** (~2200 lines) — `ModelPatcher` wraps loaded models, handles weight patching (LoRA, etc.), device movement, and memory tracking. `patch_model()` / `unpatch_model()` manage weight modifications.
+- **`comfy/sd.py`** (~2200 lines) — High-level model loading. `load_diffusion_model()`, `load_clip()`, `load_vae()` orchestrate loading safetensors files into model architectures. Uses `comfy.utils.load_torch_file()` for the actual file I/O.
+- **`comfy/utils.py`** (~1600 lines) — `load_torch_file()` is the universal file loading function. For safetensors, it uses `safetensors.safe_open()` with mmap. The `--disable-mmap` `tensor.to(device=device, copy=True)` copy path is guarded by `if DISABLE_MMAP and not unified:` (`comfy/utils.py:212`) — on unified memory the copy is skipped, which is why `--disable-mmap` is a no-op on GB10.
+- **`comfy/ops.py`** (~1550 lines) — Custom PyTorch module wrappers (`Linear`, `Conv2d`, etc.) that handle dtype casting and device placement during inference.
 - **`comfy/model_detection.py`** — Identifies model architecture from state dict key patterns.
 - **`comfy/supported_models.py` / `supported_models_base.py`** — Model architecture definitions and configurations.
 
@@ -116,9 +113,9 @@ See `dev-docs/dgx-spark-comfyui-loader-plan.md` for the original analysis and `d
 - Unified memory gotcha: `load_state_dict(assign=True)` preserves checkpoint dtypes — if a checkpoint has mixed dtypes, the model will too. Any `load_state_dict(assign=True)` call site must follow with `.to(target_dtype)` to normalize. See `comfy/sd.py` VAE loading for the pattern.
 - The VAE decoder uses `disable_weight_init` ops (hardcoded, not from `pick_operations()`), meaning `comfy_cast_weights=False` — no runtime dtype casting. The diffusion model uses `manual_cast` ops which cast at runtime. Keep this asymmetry in mind when debugging dtype errors.
 - Unified memory gotcha: `load_state_dict(assign=True)` replaces pre-allocated parameter buffers — the originals become unreferenced but stay resident until `gc.collect()`. For large models (Flux2.dev FP16 = ~24GB) this transient can OOM. Fixed: `comfy/model_base.py::load_model_weights` calls `gc.collect()` gated on `assign=True` immediately after `del to_load`. Do not remove this; do not add `torch.cuda.empty_cache()` here (that's `cache_policy`'s domain).
-- SageAttention runtime verification: `--use-sage-attention` swaps `optimized_attention = attention_sage` at module init (`comfy/ldm/modules/attention.py:725`). Runtime confirmation comes from (1) `[attention] sageattn first call ok` INFO log on the first successful `sageattn()` call, (2) aggregate `sageattn_calls` / `sageattn_fallbacks` counters logged at process exit via `atexit`. If the shutdown summary shows `sageattn_calls=0`, the swap failed upstream — check model-specific attention dispatch.
+- SageAttention runtime verification: `--use-sage-attention` swaps `optimized_attention = attention_sage` at module init (`comfy/ldm/modules/attention.py:771`). Runtime confirmation comes from (1) `[attention] sageattn first call ok` INFO log on the first successful `sageattn()` call, (2) aggregate `sageattn_calls` / `sageattn_fallbacks` counters logged at process exit via `atexit`. If the shutdown summary shows `sageattn_calls=0`, the swap failed upstream — check model-specific attention dispatch.
 - Feature branches use git worktrees at `.worktrees/<branch-name>` (gitignored). Create with `git worktree add .worktrees/<name> -b <branch>`, clean up with `git worktree remove .worktrees/<name>`.
-- Transformers >=5.x causes explosive memory growth on HunyuanImage3. Pinned to 4.x (exact version needs verification via `pip show transformers`). See `dev-docs/transformers-5x-memory-regression.md` for investigation plan.
+- Transformers >=5.x causes explosive memory growth on HunyuanImage3. Pinned to `transformers==4.57.3` (in both `pyproject.toml` and `requirements.txt`). See `dev-docs/transformers-5x-memory-regression.md` for investigation plan.
 - `safetensors.safe_open()` is a Rust binding that does not expose its file descriptor or mmap region. To call `posix_fadvise()` on a safetensors file during loading, open a separate read-only fd via `os.open(path, os.O_RDONLY)`. On Linux, `FADV_DONTNEED` on a separate fd advises the kernel to drop clean page cache pages even while the original mmap is active.
 - Testing `load_torch_file()`: (1) `comfy.model_management` must be imported before `monkeypatch.setattr` — it's a namespace package that isn't auto-resolved. Use `import comfy.model_management` then `monkeypatch.setattr(comfy.model_management, "ATTR", value)`. (2) Progress ticks and mid-load page cache drops are gated on `logging.getLogger().isEnabledFor(logging.INFO)` — tests must use `caplog.at_level(logging.INFO)` to trigger tick-dependent behavior.
 - Unified memory gotcha: On Spark there are TWO independent memory caches that consume the shared pool. (1) **PyTorch CUDA allocator cache** (`torch.cuda.memory_reserved - memory_allocated`) — freed tensors that torch holds for reuse; cleared by `soft_empty_cache_unified()` / `torch.cuda.empty_cache()`. (2) **OS page cache** (`buff/cache` in `free -h`) — mmap'd file pages from `safetensors.safe_open()`; cleared by `posix_fadvise(POSIX_FADV_DONTNEED)` per-file or `echo 3 > /proc/sys/vm/drop_caches` (requires root). The gap between `torch free` and `sys avail` in `memory_report` output is primarily OS page cache. `--drop-page-cache` (auto-enabled on unified memory) addresses layer 2; `--cache-aggressiveness` addresses layer 1.
