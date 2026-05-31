@@ -1,0 +1,22 @@
+# Load-bearing version pins for the DGX Spark environment.
+#
+# Use this as a pip/uv CONSTRAINTS file (the `-c` flag), NOT a requirements file.
+# A constraints file does not install anything by itself; it caps the versions
+# that other installs are allowed to resolve to. This is how we install a custom
+# node's own requirements.txt without letting it drag a load-bearing package to a
+# version that breaks the Spark fork.
+#
+#   uv pip install -r custom_nodes/<node>/requirements.txt -c constraints.txt
+#
+# Why each pin:
+#   transformers==4.57.3  Hunyuan node declares `transformers>=4.47.0` (no upper
+#                         bound). Transformers >=5.x causes explosive memory growth
+#                         on HunyuanImage3 (see CLAUDE.md / dev-docs/transformers-5x-
+#                         memory-regression.md). This pin neutralizes that.
+#   torch==2.12.0         The aarch64 PyPI wheel is CUDA-13-bundled (2.12.0+cu130)
+#                         and drives the whole GB10/sm_121 GPU stack. Never let a
+#                         transitive dep upgrade it.
+#   numpy==2.4.6          Matches the resolved env; avoids ABI churn against torch.
+transformers==4.57.3
+torch==2.12.0
+numpy==2.4.6
