@@ -1024,14 +1024,47 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             loaded_memory = loaded_model.model_loaded_memory()
             current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
-            lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
-            lowvram_model_memory = lowvram_model_memory - loaded_memory
+            if UNIFIED_MEMORY and current_free_mem >= model.model_size() + minimum_memory_required:
+                # Unified memory: "offloaded" weights stay physically resident in the same
+                # pool (offload_device == load_device), so the lowvram split saves no memory
+                # and is pure churn — per-layer cast-on-demand every step. Worse, loaded_size()
+                # only counts the resident portion, so each run's get_free_memory() reads lower
+                # and the budget drifts downward run-over-run, flipping ever more weights onto
+                # the cast path. When the whole model fits the pool with inference headroom,
+                # load it fully resident (lowvram_model_memory == 0 -> uncapped in model_load).
+                lowvram_model_memory = 0
+            else:
+                lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
+                lowvram_model_memory = lowvram_model_memory - loaded_memory
 
-            if lowvram_model_memory == 0:
-                lowvram_model_memory = 0.1
+                if lowvram_model_memory == 0:
+                    lowvram_model_memory = 0.1
 
         if vram_set_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
+
+        # LOAD_BUDGET: attribution for why a model loads fully vs partially. On unified
+        # memory the budget is driven by get_free_memory() at this instant; "offloaded"
+        # weights stay physically resident (offload_device == load_device), so a shrinking
+        # budget across runs is churn, not a real saving. See CLAUDE.md unified-memory notes.
+        if not is_device_cpu(torch_dev):
+            _gb = 1024 * 1024 * 1024
+            _model_size = model.model_size()
+            # 0 means "no cap" (model_load promotes it to 1e32 -> full load).
+            _capped = 0 < lowvram_model_memory < 1e32
+            _budget_str = "{:.2f}G".format(lowvram_model_memory / _gb) if _capped else "uncapped(full)"
+            logging.info(
+                "LOAD_BUDGET %s | model_size %.2fG loaded_now %.2fG free %.2fG "
+                "min_required %.2fG -> budget(usable) %s fits_fully=%s | %s",
+                type(model).__name__,
+                _model_size / _gb,
+                loaded_model.model_loaded_memory() / _gb,
+                get_free_memory(torch_dev) / _gb,
+                minimum_memory_required / _gb,
+                _budget_str,
+                (not _capped) or lowvram_model_memory >= _model_size,
+                memory_report(device=torch_dev),
+            )
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
         vram_used = 0 if is_device_cpu(torch_dev) else loaded_model.model_loaded_memory()

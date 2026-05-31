@@ -97,6 +97,7 @@ See `dev-docs/dgx-spark-comfyui-loader-plan.md` for the original analysis and `d
 
 ## Development Rules
 
+- This Claude Code harness does NOT provide the `Grep`/`Glob` tools (calling `Grep` hard-fails with "No such tool available"). Search via `Bash` using `ugrep` (`ug`/`ugrep`) for content and `bfs` for file/path finding — both are installed for this purpose. The `Explore` agent also works for broad fan-out searches.
 - Use `uv` for all Python environment management. The venv is at `.venv/` under the project root.
 - `pip` is NOT installed in `.venv` — `python -m pip` finds nothing. Always use `uv pip …` / `uv sync` / `uv run`.
 - `pyproject.toml` + `uv.lock` are the canonical dependency source (env is built by `uv sync`). `requirements.txt` is vestigial upstream baggage and does NOT match the installed env (e.g. it lists `comfyui-frontend-package==1.44.19` but `1.42.8` from pyproject is installed) — do not `uv pip install -r requirements.txt`. The two have drifted; this is intentional (documented, not reconciled). See `dev-docs/environment-setup.md`.
