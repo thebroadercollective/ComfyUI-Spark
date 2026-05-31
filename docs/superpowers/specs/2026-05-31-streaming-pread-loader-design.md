@@ -51,6 +51,16 @@ one-tensor in-memory blob. This is *more* general and *less* code. We own only h
 architectures and dtype mixes, **not** specialized to Flux.2 Dev. This drove the most
 significant change vs the draft — see [Dtype Generality](#dtype-generality).
 
+## Post-Implementation Refinements (2026-05-31, after first live run)
+
+Shipped and verified on a full Flux.2 Dev run (no swap, free never < ~20GB, ~90s faster). Three refinements followed from the live log:
+
+1. **CPU target too.** The streamer was generalized from CUDA-only to any unified large load, including the explicit-CPU `--cpu-text-enc` text-encoder path (the ~33GB mistral encoder, which as `cpu-explicit`/`safe_open` leaked ~33GB of un-evictable page cache). Function renamed `_stream_safetensors_to_cuda` → `_stream_safetensors_to_device(..., target_device)`; gate now admits `stream_target ∈ {cuda, cpu}`; `method=` is `unified-cuda-stream` / `unified-cpu-stream`. Byte-identical to `safe_open(device='cpu')` (tested).
+2. **Log FREE, not just available.** Load logs now show `free X avail Y` (ticks) and `sys free X avail Y used Z` (bookends, via `memory_report`); `memory_delta` adds `Δfree`. `free` excludes buff/cache and is the real pressure signal; `available` masked it (it was pinned at ~116G while cache silently filled).
+3. **Unconditional unified full-load.** The first-generation `LOAD_BUDGET` showed `fits_fully=False` because the residency probe (`_model_weights_on_device`) raced the accounting. Replaced with `unified_full_load = bool(UNIFIED_MEMORY)` (helper removed): the model is always already resident here (loaded straight to the pool), a too-big model would have OOM'd during load, and this branch never runs for CPU targets — so full-load is unconditionally correct on unified. First-gen now logs `fits_fully=True` / `loaded completely`.
+
+Note (not changed): the post-text-encoder OS page cache observed lingering in the first run is addressed by #1 — mistral now streams with bounded, evicted cache instead of the safe_open leak.
+
 ## Executive Summary
 
 On the DGX Spark, loading a large safetensors model (e.g. `flux2-dev.safetensors`,

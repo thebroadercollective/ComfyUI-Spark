@@ -1,11 +1,12 @@
 """Unit tests for the unified-memory streaming safetensors loader.
 
-The streaming loader (_stream_safetensors_to_cuda in comfy/utils.py) replaces
+The streaming loader (_stream_safetensors_to_device in comfy/utils.py) replaces
 safetensors.safe_open for large unified-memory loads so that posix_fadvise(DONTNEED) can
 actually evict OS page cache mid-load (safe_open holds the whole file mmap'd, which pins it).
 These tests verify it is a byte-exact drop-in for safe_open and that gating/fallback behave.
 
-The loader targets CUDA, so the round-trip tests are skipped when CUDA is unavailable.
+It handles both CUDA and explicit-CPU (--cpu-text-enc) targets. The CUDA round-trip tests are
+skipped when CUDA is unavailable; the CPU-target test runs everywhere.
 """
 
 import os
@@ -46,6 +47,41 @@ def _safe_open_ref(path):
     return keys, ref
 
 
+class TestStreamingCpuTarget:
+    """CPU stream target (the --cpu-text-enc path) must byte-match safe_open(device='cpu').
+
+    No CUDA needed — this is the text-encoder load path (e.g. mistral via --cpu-text-enc),
+    which is large (>5GB) and was previously routed through cpu-explicit/safe_open (live mmap,
+    ineffective mid-load drop). It now streams to CPU.
+    """
+
+    def test_cpu_byte_identical_to_safe_open(self, tmp_path):
+        import time
+        import safetensors
+        import comfy.utils as U
+
+        model = {
+            "a.w": torch.randn(128, 256).to(torch.bfloat16),
+            "a.b": torch.randn(256),
+            "c.w": torch.randn(64, 64, dtype=torch.float16),
+            "z": torch.empty((0,), dtype=torch.float32),
+        }
+        path = _save(tmp_path, "te.safetensors", model, metadata={"k": "v"})
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            ref_keys = list(f.keys())
+            ref = {k: f.get_tensor(k) for k in ref_keys}
+
+        sd, meta, n = U._stream_safetensors_to_device(
+            path, "te.safetensors", os.path.getsize(path), time.perf_counter(), True, "cpu")
+
+        assert list(sd.keys()) == ref_keys
+        assert meta == {"k": "v"}
+        for k in ref:
+            assert sd[k].device.type == "cpu", k
+            assert sd[k].dtype == ref[k].dtype, k
+            assert _bytes_eq(ref[k], sd[k]), k
+
+
 @cuda_only
 class TestStreamingReconstruction:
     """The streamed sd must be byte-identical to safe_open(device='cuda')."""
@@ -71,8 +107,8 @@ class TestStreamingReconstruction:
         path = _save(tmp_path, "mixed.safetensors", self._mixed_dtype_model())
         ref_keys, ref = _safe_open_ref(path)
 
-        sd, meta, n = U._stream_safetensors_to_cuda(
-            path, "mixed.safetensors", os.path.getsize(path), time.perf_counter(), False)
+        sd, meta, n = U._stream_safetensors_to_device(
+            path, "mixed.safetensors", os.path.getsize(path), time.perf_counter(), False, "cuda")
 
         assert set(sd) == set(ref)
         assert n == len(ref)
@@ -88,8 +124,8 @@ class TestStreamingReconstruction:
         import comfy.utils as U
         path = _save(tmp_path, "meta.safetensors", {"x": torch.randn(4)}, metadata={"foo": "bar"})
         sz = os.path.getsize(path)
-        _, m_none, _ = U._stream_safetensors_to_cuda(path, "m", sz, time.perf_counter(), False)
-        _, m_yes, _ = U._stream_safetensors_to_cuda(path, "m", sz, time.perf_counter(), True)
+        _, m_none, _ = U._stream_safetensors_to_device(path, "m", sz, time.perf_counter(), False, "cuda")
+        _, m_yes, _ = U._stream_safetensors_to_device(path, "m", sz, time.perf_counter(), True, "cuda")
         assert m_none is None
         assert m_yes == {"foo": "bar"}
 
@@ -132,7 +168,7 @@ class TestStreamingFallback:
         with open(p, "wb") as fh:
             fh.write(struct.pack("<Q", len(hb)) + hb + raw)
         with pytest.raises(Exception):
-            U._stream_safetensors_to_cuda(p, "bad", os.path.getsize(p), time.perf_counter(), False)
+            U._stream_safetensors_to_device(p, "bad", os.path.getsize(p), time.perf_counter(), False, "cuda")
 
     def test_load_torch_file_falls_back_on_bad_header(self, tmp_path, monkeypatch, caplog):
         """If the stream path raises, load_torch_file must fall back to safe_open and still load."""

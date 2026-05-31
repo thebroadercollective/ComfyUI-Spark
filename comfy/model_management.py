@@ -28,7 +28,6 @@ import platform
 import weakref
 import gc
 import os
-import itertools
 from contextlib import contextmanager, nullcontext
 import comfy.memory_management
 import comfy.system_memory
@@ -930,32 +929,6 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
                 soft_empty_cache()
     return unloaded_models
 
-def _model_weights_on_device(model, device):
-    """Best-effort check: are ALL the model's weights already physically resident on `device`?
-
-    On unified memory, load_torch_file loads CUDA-targeted models directly into the pool, so by
-    the time load_models_gpu computes the budget the tensors are already resident and a "full
-    load" costs ~0 additional bytes. We require *every* non-meta parameter/buffer to be on
-    `device`: a single off-device tensor means full-loading would still need to move it, so
-    inferring "resident" from one sample could under-budget a mixed-residency model. Returns
-    True only if at least one real tensor exists and all real tensors are on `device`; False on
-    any off-device tensor, an all-meta module, or any error. Iterating params/buffers moves no
-    data, so the full scan is cheap.
-    """
-    try:
-        m = model.model  # ModelPatcher -> BaseModel (nn.Module)
-        saw_real = False
-        for t in itertools.chain(m.parameters(), m.buffers()):
-            if getattr(t, "is_meta", False):
-                continue
-            saw_real = True
-            if t.device.type != device.type:
-                return False
-        return saw_real
-    except Exception:
-        pass
-    return False
-
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     _lmg_entry_snap = memory_report()
     logging.info(
@@ -1061,12 +1034,16 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             # question is "is there inference headroom?", not "is there room for a 2nd copy".
             # If the model is already resident, full-loading needs only minimum_memory_required;
             # otherwise (defensive, not hit on the unified-cuda path) it needs the full size too.
-            if UNIFIED_MEMORY:
-                already_resident = _model_weights_on_device(model, torch_dev)
-                needed = minimum_memory_required if already_resident else model.model_size() + minimum_memory_required
-                unified_full_load = current_free_mem >= needed
-            else:
-                unified_full_load = False
+            # On unified memory the model is already physically resident in the pool by the time we
+            # get here — load_torch_file loaded a cuda-target model straight to CUDA (alloc ==
+            # model_size on the LOAD_BUDGET line), and this branch only runs for non-cpu targets
+            # (cpu targets take the DISABLED state above and skip it). offload_device ==
+            # load_device, so the lowvram split frees no memory and only adds per-step
+            # cast-on-demand churn; worse, loaded_size() counts only the resident portion, so a
+            # capped budget drifts down run-over-run. Therefore always full-load on unified. A
+            # model too big for the pool would have OOM'd during load, before reaching here, so
+            # there is no "doesn't fit" case left to degrade for.
+            unified_full_load = bool(UNIFIED_MEMORY)
 
             if unified_full_load:
                 lowvram_model_memory = 0
@@ -2233,11 +2210,15 @@ def memory_report(*, device=None) -> str:
 
     try:
         vm = psutil.virtual_memory()
+        # `free` excludes buff/cache — it is the number that, when it nears 0, forces the kernel
+        # to reclaim page cache / swap (the load-time pressure we manage). `available` includes
+        # reclaimable cache and so masks that pressure; report both.
+        sys_free = _fmt_gb(vm.free)
         sys_avail = _fmt_gb(vm.available)
         sys_used = _fmt_gb(vm.used)
     except Exception:
-        sys_avail = sys_used = "?G"
-    sys_part = "sys avail {} used {}".format(sys_avail, sys_used)
+        sys_free = sys_avail = sys_used = "?G"
+    sys_part = "sys free {} avail {} used {}".format(sys_free, sys_avail, sys_used)
 
     if torch_part is None:
         return sys_part
@@ -2260,11 +2241,16 @@ def _parse_gb_field(text: str, prefix: str) -> float | None:
 def memory_delta(before: str, after: str) -> str:
     b_alloc = _parse_gb_field(before, "alloc ")
     a_alloc = _parse_gb_field(after, "alloc ")
-    b_sys = _parse_gb_field(before, "sys avail ")
-    a_sys = _parse_gb_field(after, "sys avail ")
+    b_sys = _parse_gb_field(before, "avail ")
+    a_sys = _parse_gb_field(after, "avail ")
+    b_free = _parse_gb_field(before, "sys free ")
+    a_free = _parse_gb_field(after, "sys free ")
     if None in (b_alloc, a_alloc, b_sys, a_sys):
         return "Δtorch ?G Δavail ?G"
-    return "Δtorch {:+.1f}G Δavail {:+.1f}G".format(a_alloc - b_alloc, a_sys - b_sys)
+    free_part = ""
+    if b_free is not None and a_free is not None:
+        free_part = " Δfree {:+.1f}G".format(a_free - b_free)
+    return "Δtorch {:+.1f}G Δavail {:+.1f}G{}".format(a_alloc - b_alloc, a_sys - b_sys, free_part)
 
 def unload_all_models():
     for device in get_all_torch_devices():
