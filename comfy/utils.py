@@ -94,6 +94,22 @@ def _incomplete_safetensors_error(message, ckpt):
     return ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
 
 
+# Streaming-load tuning for the unified-memory large-file path (see
+# docs/superpowers/specs/2026-05-31-streaming-pread-loader-design.md).
+STREAMING_LOAD_THRESHOLD = 5 * 1024 ** 3   # only stream files this large
+STREAMING_DROP_INTERVAL = 512 * 1024 ** 2  # fadvise(DONTNEED) cadence; bounds page-cache transient
+
+# safetensors' OWN dtype map, used for membership-only pre-flight validation so the streamer's
+# dtype coverage is exactly safe_open's (it never converts dtypes itself — that is delegated to
+# safetensors.torch.load). Guarded: if this private symbol ever disappears, the stream path is
+# disabled and loads fall back to safe_open. Do NOT substitute the fork-local _TYPES above (it is
+# a strict subset and would silently route newer dtypes to the slow path).
+try:
+    from safetensors.torch import _TYPES as _SAFETENSORS_DTYPES
+except Exception:
+    _SAFETENSORS_DTYPES = None
+
+
 def load_safetensors(ckpt):
     import comfy_aimdo.model_mmap
 
@@ -171,6 +187,214 @@ def _maybe_drop_page_cache(filepath, total_size):
         )
 
 
+def _stream_safetensors_to_cuda(ckpt, basename, total_size, load_start_time, return_metadata):
+    """Load a large safetensors file directly to CUDA without holding the whole file mmap'd.
+
+    safetensors.safe_open mmaps the entire file for the lifetime of the load, which pins its
+    bytes in OS page cache so posix_fadvise(DONTNEED) cannot evict them mid-load — on unified
+    memory that is a transient second copy of the whole model (the 2x that drives swap thrash).
+    This reader instead pread()s each tensor's bytes (unmapped pages), reconstructs the tensor
+    by delegating to safetensors.torch.load on a one-tensor in-memory blob (so dtype/shape/
+    packing coverage is exactly the library's), copies it to CUDA, and periodically drops the
+    now-evictable page cache. Returns (sd, metadata, tensors_loaded). Raises on any error; the
+    caller falls back to safe_open. See docs/superpowers/specs/2026-05-31-streaming-pread-loader-design.md.
+    """
+    fd = os.open(ckpt, os.O_RDONLY)
+    try:
+        hdr_len = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+        header = json.loads(os.pread(fd, hdr_len, 8))
+        data_base = 8 + hdr_len
+        metadata = header.get("__metadata__", None)
+        tensors = [(k, v) for k, v in header.items() if k != "__metadata__"]
+
+        # Pre-flight: every dtype must be one safetensors itself can reconstruct. Unknown ->
+        # bail to the whole-file safe_open fallback (identical coverage, zero regression).
+        for k, info in tensors:
+            if info["dtype"] not in _SAFETENSORS_DTYPES:
+                raise ValueError("unsupported dtype {!r} for tensor {!r}".format(info["dtype"], k))
+
+        # Read in file (offset) order for sequential I/O; the returned dict is re-keyed below to
+        # match safe_open's ordering (safe_open yields keys sorted — verified against the lib).
+        read_order = sorted(tensors, key=lambda kv: kv[1]["data_offsets"][0])
+
+        tick_enabled = logging.getLogger().isEnabledFor(logging.INFO)
+        total_count = len(read_order)
+        sd = {}
+        bytes_loaded = 0
+        tensors_loaded = 0
+        bytes_since_drop = 0
+        last_tick_time = load_start_time
+        last_tick_bytes = 0
+
+        for name, info in read_order:
+            begin, end = info["data_offsets"]
+            nbytes = end - begin
+            raw = bytearray(nbytes)
+            if nbytes:
+                mv = memoryview(raw)
+                got = 0
+                while got < nbytes:
+                    n = os.preadv(fd, [mv[got:]], data_base + begin + got)
+                    if n <= 0:
+                        raise IOError("short read on {}: {} of {} bytes".format(name, got, nbytes))
+                    got += n
+            # One-tensor in-memory safetensors blob: the library owns all reconstruction.
+            # `bytes + bytearray` yields bytes (which safetensors.torch.load requires), so append
+            # `raw` directly instead of bytes(raw) to avoid an extra full-tensor host copy.
+            one_header = {name: {"dtype": info["dtype"], "shape": info["shape"], "data_offsets": [0, nbytes]}}
+            hb = json.dumps(one_header).encode("utf-8")
+            blob = struct.pack("<Q", len(hb)) + hb + raw
+            sd[name] = safetensors.torch.load(blob)[name].to("cuda")
+            del raw, blob
+
+            bytes_loaded += nbytes
+            tensors_loaded += 1
+            bytes_since_drop += nbytes
+
+            # pread pages are not mmap'd, so fadvise(DONTNEED) actually evicts them here.
+            if bytes_since_drop >= STREAMING_DROP_INTERVAL:
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+                bytes_since_drop = 0
+
+            if tick_enabled:
+                now = time.perf_counter()
+                if (now - last_tick_time) >= 30.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                    try:
+                        sys_avail_str = "{:.1f}G".format(psutil.virtual_memory().available / (1024 ** 3))
+                    except Exception:
+                        sys_avail_str = "?G"
+                    pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
+                    logging.info(
+                        "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
+                        basename, bytes_loaded / (1024 ** 3), total_size / (1024 ** 3),
+                        pct, tensors_loaded, total_count, sys_avail_str,
+                    )
+                    # Unlike the safe_open path, this drop is effective (no live mmap), so sys
+                    # avail above should stay roughly flat across ticks instead of falling ~2x.
+                    logging.info(
+                        "  PAGE_CACHE_DROP_TICK file=%s %.1fG/%.1fG (%.0f%%) | sys avail %s",
+                        basename, bytes_loaded / (1024 ** 3), total_size / (1024 ** 3),
+                        pct, sys_avail_str,
+                    )
+                    last_tick_time = now
+                    last_tick_bytes = bytes_loaded
+
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+
+    # Match safe_open's dict ordering exactly: safetensors.safe_open().keys() yields keys in
+    # sorted order, and the original unified-cuda path built sd by iterating f.keys(). We read in
+    # offset order for sequential I/O, so re-key into sorted order here to be a true drop-in.
+    ordered = {k: sd[k] for k in sorted(sd.keys())}
+    if not return_metadata:
+        metadata = None
+    return ordered, metadata, tensors_loaded
+
+
+def _safe_open_load_safetensors(ckpt, device, explicit_device, unified, basename, total_size, load_start_time, return_metadata):
+    """Load a safetensors file via safetensors.safe_open (whole-file mmap).
+
+    This is the original load path: used for small / explicit-device / non-unified loads, and as
+    the fallback when the streaming path bails. Returns (sd, metadata, tensors_loaded).
+    """
+    metadata = None
+    if unified and not explicit_device:
+        load_device = "cuda"
+        logging.debug("Unified memory: loading %s directly to CUDA", basename)
+    else:
+        load_device = device.type
+
+    _drop_fd = None
+    # Mid-load drops only for large files (>=5GB) where page cache accumulation causes kernel
+    # reclaim pressure before the post-load drop. NOTE: while safe_open holds the file mmap'd,
+    # these drops are largely ineffective (mapped pages are skipped) — the streaming loader is
+    # the real fix; this remains for the non-streaming fallback paths.
+    _mid_load_drop = (
+        (args.drop_page_cache or unified)
+        and total_size >= 5 * 1024 ** 3
+        and hasattr(os, 'posix_fadvise')
+    )
+    try:
+        if _mid_load_drop:
+            try:
+                _drop_fd = os.open(ckpt, os.O_RDONLY)
+            except OSError:
+                _mid_load_drop = False
+
+        with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
+            sd = {}
+            tick_enabled = (
+                logging.getLogger().isEnabledFor(logging.INFO)
+                and total_size >= 5 * 1024 ** 3
+            )
+            bytes_loaded = 0
+            tensors_loaded = 0
+            last_tick_time = load_start_time
+            last_tick_bytes = 0
+            key_list = list(f.keys())
+            total_count = len(key_list)
+            for k in key_list:
+                tensor = f.get_tensor(k)
+                if DISABLE_MMAP and not unified:
+                    tensor = tensor.to(device=device, copy=True)
+                sd[k] = tensor
+                if tick_enabled:
+                    try:
+                        bytes_loaded += tensor.element_size() * tensor.numel()
+                    except Exception:
+                        pass
+                    tensors_loaded += 1
+                    now = time.perf_counter()
+                    # 5GB byte threshold is the primary trigger; 30s is a backstop for slow I/O
+                    if (now - last_tick_time) >= 30.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
+                        try:
+                            sys_avail = psutil.virtual_memory().available / (1024 ** 3)
+                            sys_avail_str = "{:.1f}G".format(sys_avail)
+                        except Exception:
+                            sys_avail_str = "?G"
+                        pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
+                        logging.info(
+                            "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
+                            basename,
+                            bytes_loaded / (1024 ** 3),
+                            total_size / (1024 ** 3),
+                            pct,
+                            tensors_loaded,
+                            total_count,
+                            sys_avail_str,
+                        )
+                        if _drop_fd is not None:
+                            try:
+                                os.posix_fadvise(_drop_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            except OSError:
+                                pass
+                            logging.info(
+                                "  PAGE_CACHE_DROP_TICK file=%s %.1fG/%.1fG (%.0f%%) | sys avail %s",
+                                basename,
+                                bytes_loaded / (1024 ** 3),
+                                total_size / (1024 ** 3),
+                                pct,
+                                sys_avail_str,
+                            )
+                        last_tick_time = now
+                        last_tick_bytes = bytes_loaded
+                else:
+                    tensors_loaded += 1
+            if return_metadata:
+                metadata = f.metadata()
+    finally:
+        if _drop_fd is not None:
+            os.close(_drop_fd)
+    return sd, metadata, tensors_loaded
+
+
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     explicit_device = device is not None
     if device is None:
@@ -185,8 +409,20 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         import comfy.model_management
         try:
             unified = comfy.model_management.UNIFIED_MEMORY
+            # Stream large unified-cuda loads to avoid the safe_open whole-file mmap that pins a
+            # transient 2x copy in OS page cache (the swap-thrash cause). See
+            # docs/superpowers/specs/2026-05-31-streaming-pread-loader-design.md.
+            use_stream = (
+                unified and not explicit_device
+                and not comfy.memory_management.aimdo_enabled
+                and total_size >= STREAMING_LOAD_THRESHOLD
+                and _SAFETENSORS_DTYPES is not None
+                and hasattr(os, "preadv") and hasattr(os, "posix_fadvise")
+            )
             if comfy.memory_management.aimdo_enabled:
                 method = "aimdo"
+            elif use_stream:
+                method = "unified-cuda-stream"
             elif unified and not explicit_device:
                 method = "unified-cuda"
             elif explicit_device and device.type == "cpu":
@@ -208,93 +444,25 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                 if not return_metadata:
                     metadata = None
                 tensors_loaded = len(sd)
-            else:
-                if unified and not explicit_device:
-                    load_device = "cuda"
-                    logging.debug("Unified memory: loading %s directly to CUDA", basename)
-                else:
-                    load_device = device.type
-
-                _drop_fd = None
-                # Mid-load drops only for large files (>=5GB) where page cache
-                # accumulation causes kernel reclaim pressure before post-load drop.
-                # Post-load drops (via _maybe_drop_page_cache) cover all file sizes.
-                _mid_load_drop = (
-                    (args.drop_page_cache or unified)
-                    and total_size >= 5 * 1024 ** 3
-                    and hasattr(os, 'posix_fadvise')
-                )
+            elif use_stream:
                 try:
-                    if _mid_load_drop:
-                        try:
-                            _drop_fd = os.open(ckpt, os.O_RDONLY)
-                        except OSError:
-                            _mid_load_drop = False
-
-                    with safetensors.safe_open(ckpt, framework="pt", device=load_device) as f:
-                        sd = {}
-                        tick_enabled = (
-                            logging.getLogger().isEnabledFor(logging.INFO)
-                            and total_size >= 5 * 1024 ** 3
-                        )
-                        bytes_loaded = 0
-                        tensors_loaded = 0
-                        last_tick_time = load_start_time
-                        last_tick_bytes = 0
-                        key_list = list(f.keys())
-                        total_count = len(key_list)
-                        for k in key_list:
-                            tensor = f.get_tensor(k)
-                            if DISABLE_MMAP and not unified:
-                                tensor = tensor.to(device=device, copy=True)
-                            sd[k] = tensor
-                            if tick_enabled:
-                                try:
-                                    bytes_loaded += tensor.element_size() * tensor.numel()
-                                except Exception:
-                                    pass
-                                tensors_loaded += 1
-                                now = time.perf_counter()
-                                # 5GB byte threshold is the primary trigger; 30s is a backstop for slow I/O
-                                if (now - last_tick_time) >= 30.0 or (bytes_loaded - last_tick_bytes) >= 5 * 1024 ** 3:
-                                    try:
-                                        sys_avail = psutil.virtual_memory().available / (1024 ** 3)
-                                        sys_avail_str = "{:.1f}G".format(sys_avail)
-                                    except Exception:
-                                        sys_avail_str = "?G"
-                                    pct = (bytes_loaded / total_size * 100.0) if total_size > 0 else 0.0
-                                    logging.info(
-                                        "  LOAD %s %.1fG/%.1fG (%.0f%%) tensors=%d/%d | sys avail %s",
-                                        basename,
-                                        bytes_loaded / (1024 ** 3),
-                                        total_size / (1024 ** 3),
-                                        pct,
-                                        tensors_loaded,
-                                        total_count,
-                                        sys_avail_str,
-                                    )
-                                    if _drop_fd is not None:
-                                        try:
-                                            os.posix_fadvise(_drop_fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                                        except OSError:
-                                            pass
-                                        logging.info(
-                                            "  PAGE_CACHE_DROP_TICK file=%s %.1fG/%.1fG (%.0f%%) | sys avail %s",
-                                            basename,
-                                            bytes_loaded / (1024 ** 3),
-                                            total_size / (1024 ** 3),
-                                            pct,
-                                            sys_avail_str,
-                                        )
-                                    last_tick_time = now
-                                    last_tick_bytes = bytes_loaded
-                            else:
-                                tensors_loaded += 1
-                        if return_metadata:
-                            metadata = f.metadata()
-                finally:
-                    if _drop_fd is not None:
-                        os.close(_drop_fd)
+                    sd, metadata, tensors_loaded = _stream_safetensors_to_cuda(
+                        ckpt, basename, total_size, load_start_time, return_metadata)
+                except Exception as stream_err:
+                    logging.warning(
+                        "stream loader failed for %s (%s); falling back to safe_open",
+                        basename, stream_err)
+                    try:
+                        comfy.model_management.soft_empty_cache_unified(force=True)
+                    except Exception:
+                        pass
+                    sd, metadata, tensors_loaded = _safe_open_load_safetensors(
+                        ckpt, device, explicit_device, unified, basename, total_size,
+                        load_start_time, return_metadata)
+            else:
+                sd, metadata, tensors_loaded = _safe_open_load_safetensors(
+                    ckpt, device, explicit_device, unified, basename, total_size,
+                    load_start_time, return_metadata)
 
             metadata_keys = len(metadata) if (return_metadata and metadata is not None) else 0
             elapsed = time.perf_counter() - load_start_time

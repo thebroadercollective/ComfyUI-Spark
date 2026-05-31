@@ -33,6 +33,14 @@ def mock_comfy_env(monkeypatch):
     import comfy.memory_management
     monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
+    # These tests cover the safe_open mid-load page-cache-drop mechanism. On unified memory the
+    # streaming loader (which owns page-cache management differently) would otherwise intercept
+    # large loads, so disable it here by simulating "streaming unavailable" — exactly the guarded
+    # condition load_torch_file handles by routing to the safe_open path. Stream-path behavior is
+    # covered separately in test_streaming_loader.py.
+    import comfy.utils
+    monkeypatch.setattr(comfy.utils, "_SAFETENSORS_DTYPES", None)
+
     # Mock cache_policy.maybe_drop
     monkeypatch.setattr(comfy.cache_policy, "maybe_drop", MagicMock())
 

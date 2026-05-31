@@ -28,6 +28,7 @@ import platform
 import weakref
 import gc
 import os
+import itertools
 from contextlib import contextmanager, nullcontext
 import comfy.memory_management
 import comfy.system_memory
@@ -929,6 +930,32 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
                 soft_empty_cache()
     return unloaded_models
 
+def _model_weights_on_device(model, device):
+    """Best-effort check: are ALL the model's weights already physically resident on `device`?
+
+    On unified memory, load_torch_file loads CUDA-targeted models directly into the pool, so by
+    the time load_models_gpu computes the budget the tensors are already resident and a "full
+    load" costs ~0 additional bytes. We require *every* non-meta parameter/buffer to be on
+    `device`: a single off-device tensor means full-loading would still need to move it, so
+    inferring "resident" from one sample could under-budget a mixed-residency model. Returns
+    True only if at least one real tensor exists and all real tensors are on `device`; False on
+    any off-device tensor, an all-meta module, or any error. Iterating params/buffers moves no
+    data, so the full scan is cheap.
+    """
+    try:
+        m = model.model  # ModelPatcher -> BaseModel (nn.Module)
+        saw_real = False
+        for t in itertools.chain(m.parameters(), m.buffers()):
+            if getattr(t, "is_meta", False):
+                continue
+            saw_real = True
+            if t.device.type != device.type:
+                return False
+        return saw_real
+    except Exception:
+        pass
+    return False
+
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     _lmg_entry_snap = memory_report()
     logging.info(
@@ -1024,14 +1051,24 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             loaded_memory = loaded_model.model_loaded_memory()
             current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
-            if UNIFIED_MEMORY and current_free_mem >= model.model_size() + minimum_memory_required:
-                # Unified memory: "offloaded" weights stay physically resident in the same
-                # pool (offload_device == load_device), so the lowvram split saves no memory
-                # and is pure churn — per-layer cast-on-demand every step. Worse, loaded_size()
-                # only counts the resident portion, so each run's get_free_memory() reads lower
-                # and the budget drifts downward run-over-run, flipping ever more weights onto
-                # the cast path. When the whole model fits the pool with inference headroom,
-                # load it fully resident (lowvram_model_memory == 0 -> uncapped in model_load).
+            # Unified memory: "offloaded" weights stay physically resident in the same pool
+            # (offload_device == load_device), so the lowvram split saves no memory and is
+            # pure churn — per-layer cast-on-demand every step. On this fork's path a
+            # CUDA-targeted model was already loaded directly into the pool by load_torch_file
+            # (safe_open device="cuda"), so it is physically resident before this check runs
+            # (note alloc==model_size in LOAD_BUDGET). A full load just aliases those resident
+            # tensors as params (should_assign_weights), adding ~0 bytes. So the correct
+            # question is "is there inference headroom?", not "is there room for a 2nd copy".
+            # If the model is already resident, full-loading needs only minimum_memory_required;
+            # otherwise (defensive, not hit on the unified-cuda path) it needs the full size too.
+            if UNIFIED_MEMORY:
+                already_resident = _model_weights_on_device(model, torch_dev)
+                needed = minimum_memory_required if already_resident else model.model_size() + minimum_memory_required
+                unified_full_load = current_free_mem >= needed
+            else:
+                unified_full_load = False
+
+            if unified_full_load:
                 lowvram_model_memory = 0
             else:
                 lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
