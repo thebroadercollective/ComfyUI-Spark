@@ -213,6 +213,11 @@ def _stream_safetensors_to_device(ckpt, basename, total_size, load_start_time, r
     fd = os.open(ckpt, os.O_RDONLY)
     try:
         hdr_len = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+        # Bounds-check the untrusted header length BEFORE allocating it — a corrupt u64 would
+        # otherwise trigger a huge bytearray alloc (MemoryError) on the shared pool. Out-of-range
+        # -> clean ValueError -> caller's safe_open fallback (which rejects it identically).
+        if hdr_len <= 0 or 8 + hdr_len > total_size:
+            raise ValueError("invalid safetensors header length {} (file size {})".format(hdr_len, total_size))
         header = json.loads(os.pread(fd, hdr_len, 8))
         data_base = 8 + hdr_len
         metadata = header.get("__metadata__", None)
@@ -240,6 +245,13 @@ def _stream_safetensors_to_device(ckpt, basename, total_size, load_start_time, r
         for name, info in read_order:
             begin, end = info["data_offsets"]
             nbytes = end - begin
+            # Bounds-check the untrusted per-tensor offsets against the data section before
+            # allocating/reading — a corrupt end<begin (negative nbytes) or an over-claimed end
+            # would otherwise raise a bare ValueError/short-read. Clean ValueError -> fallback.
+            if begin < 0 or end < begin or data_base + end > total_size:
+                raise ValueError(
+                    "invalid offsets [{}, {}] for tensor {!r} (data_base {}, file size {})".format(
+                        begin, end, name, data_base, total_size))
             raw = bytearray(nbytes)
             if nbytes:
                 mv = memoryview(raw)

@@ -81,6 +81,72 @@ class TestStreamingCpuTarget:
             assert sd[k].dtype == ref[k].dtype, k
             assert _bytes_eq(ref[k], sd[k]), k
 
+    def test_end_to_end_cpu_target_uses_stream(self, tmp_path, monkeypatch, caplog):
+        """Drive load_torch_file with an explicit cpu device (the --cpu-text-enc path) and
+        assert it (a) selects method=unified-cpu-stream and (b) byte-matches safe_open(cpu).
+        Guards the rebase-fragile stream_target gate + device threading; runs without CUDA."""
+        import logging
+        import safetensors
+        import comfy.utils as U
+        import comfy.model_management
+        import comfy.memory_management
+
+        model = {
+            "w1": torch.randn(64, 128),
+            "w2": torch.randn(256, dtype=torch.float32),
+            "w3": (torch.randn(32, 32) * 50).to(torch.bfloat16),
+        }
+        path = _save(tmp_path, "e2e_cpu.safetensors", model)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            ref_keys = list(f.keys())
+            ref = {k: f.get_tensor(k) for k in ref_keys}
+
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+        monkeypatch.setattr(U, "STREAMING_LOAD_THRESHOLD", 1024)
+
+        with caplog.at_level(logging.INFO):
+            got = U.load_torch_file(path, device=torch.device("cpu"), return_metadata=False)
+
+        assert any("method=unified-cpu-stream" in r.getMessage() for r in caplog.records)
+        assert list(got.keys()) == ref_keys
+        for k in ref:
+            assert got[k].device.type == "cpu", k
+            assert got[k].dtype == ref[k].dtype, k
+            assert _bytes_eq(ref[k], got[k]), k
+
+    def test_bounds_check_rejects_corrupt_header_length(self, tmp_path):
+        """A corrupt 8-byte header-length prefix must raise ValueError (clean fallback) rather
+        than attempting a huge bytearray alloc. Runs without CUDA via the cpu target."""
+        import time
+        import comfy.utils as U
+
+        path = _save(tmp_path, "corrupt_hdr.safetensors", {"x": torch.randn(8, 8)})
+        with open(path, "r+b") as f:
+            f.write(b"\xff\xff\xff\xff\xff\xff\xff\xff")
+        with pytest.raises(ValueError, match="invalid safetensors header length"):
+            U._stream_safetensors_to_device(
+                path, "corrupt_hdr", os.path.getsize(path), time.perf_counter(), False, "cpu")
+
+    def test_bounds_check_rejects_corrupt_offsets(self, tmp_path):
+        """A per-tensor data_offset that runs past the file must raise ValueError (clean
+        fallback) rather than a bare short-read/negative-alloc. Runs without CUDA.
+
+        Hand-build a file with a VALID JSON header whose data_offsets claim a tensor far past
+        EOF, so the parse succeeds and we reach (and trip) the per-tensor offset bounds check."""
+        import time
+        import comfy.utils as U
+
+        # Valid header, but 'x' claims 64 bytes of data when the file body holds only 4.
+        hdr = {"x": {"dtype": "F32", "shape": [1], "data_offsets": [0, 64]}}
+        hb = json.dumps(hdr).encode("utf-8")
+        p = str(tmp_path / "corrupt_off.safetensors")
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", len(hb)) + hb + os.urandom(4))
+        with pytest.raises(ValueError, match="invalid offsets"):
+            U._stream_safetensors_to_device(
+                p, "corrupt_off", os.path.getsize(p), time.perf_counter(), False, "cpu")
+
 
 @cuda_only
 class TestStreamingReconstruction:
