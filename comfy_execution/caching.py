@@ -519,6 +519,18 @@ def all_outputs_dynamic(outputs):
 
     return True
 
+
+def _outputs_contain_model_patcher(outputs):
+    if outputs is None:
+        return False
+    for output in outputs:
+        if isinstance(output, (list, tuple)):
+            if _outputs_contain_model_patcher(output):
+                return True
+        elif isinstance(output, ModelPatcher):
+            return True
+    return False
+
 class RAMPressureCache(LRUCache):
 
     def __init__(self, key_class, enable_providers=False):
@@ -551,6 +563,21 @@ class RAMPressureCache(LRUCache):
         if virtual_memory_available() >= target:
             return 0
 
+        # Unified memory: a current-generation entry holding a ModelPatcher is the single
+        # resident copy of a model the live workflow references (offload_device ==
+        # load_device, so the weights are in the one shared pool). Under free_active=True
+        # the loop below would otherwise evict it -- current-gen patchers score as tiny
+        # default entries because the 1e30 marker in scan_list_for_ram_usage only tags
+        # OLD-gen patchers -- del'ing the node cache's last reference and freeing tens of GB
+        # mid-workflow, forcing a multi-minute reload. Evicting it frees nothing the torch
+        # allocator wouldn't (same pool); the real relief comes from evicting CPU-tensor
+        # outputs, which stay eligible below. Stale OLD-gen models also stay eligible.
+        # NOTE for CLAUDE.md readers: this is the output-cache path by which the RAM-pressure
+        # system *can* free model weights -- distinct from (and live unlike) the dead
+        # free_pins() pin-pressure path. Lazy import avoids a circular import at module load.
+        import comfy.model_management
+        protect_resident_models = comfy.model_management.UNIFIED_MEMORY
+
         clean_list = []
 
         for key, cache_entry in self.cache.items():
@@ -558,6 +585,10 @@ class RAMPressureCache(LRUCache):
                 continue
 
             if all_outputs_dynamic(cache_entry.outputs) and self.used_generation[key] == self.generation:
+                continue
+
+            if protect_resident_models and self.used_generation[key] == self.generation \
+                    and _outputs_contain_model_patcher(cache_entry.outputs):
                 continue
 
             oom_score = RAM_CACHE_OLD_WORKFLOW_OOM_MULTIPLIER ** (self.generation - self.used_generation[key])
