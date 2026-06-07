@@ -43,7 +43,7 @@ git stash pop
 
 ## Expected conflict
 
-Conflicts have shown up in two files. `model_patcher.py` did **not** conflict on the 2026-05-28 sync (it auto-merged clean), so don't assume it always will — verify the invariant below regardless.
+Conflicts have shown up in two files. `model_patcher.py` did **not** conflict on the 2026-05-28 sync (it auto-merged clean), and the 2026-06-06 sync (v0.22.0 → v0.24.1, 60 upstream commits) replayed all 23 fork commits with **zero** conflicts — so don't assume conflicts, but verify the invariants below regardless. On 2026-06-06 upstream's changes to the sensitive files were all aimdo/dynamic-pin internals plus new model support (TripoSplat, Ideogram4); it also removed the `is_dynamic()` gate in `free_memory`'s smart-memory branch (see the updated CLAUDE.md note — behavior is strictly milder, no fork action needed).
 
 ### `comfy/model_patcher.py` — invertible LoRA fast-path
 
@@ -74,7 +74,7 @@ Restore the `models` symlink and pop any stash (above), then verify before trust
 grep -rn '^<<<<<<<\|^>>>>>>>\|^=======' comfy/ || echo "no conflict markers"
 uv run python -c "import comfy.model_patcher"   # a broken merge can still parse; importing catches more
 uvx ruff check comfy/model_patcher.py
-git rev-list --count upstream/master..HEAD       # = number of fork commits (currently 10)
+git rev-list --count upstream/master..HEAD       # = number of fork commits (23 on the 2026-06-06 sync)
 git rev-list --count HEAD..upstream/master       # = 0
 ```
 
