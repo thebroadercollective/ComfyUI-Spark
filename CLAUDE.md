@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ComfyUI-Spark is a fork of [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (v0.26.0) optimized for the NVIDIA DGX Spark (GB10, sm_121, 128GB unified LPDDR5x memory). The core optimization goal is eliminating redundant memory copies during model loading — on unified memory, the standard ComfyUI loading pipeline creates 2-3x memory usage because it assumes separate RAM/VRAM pools.
+ComfyUI-Spark is a fork of [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (v0.27.0) optimized for the NVIDIA DGX Spark (GB10, sm_121, 128GB unified LPDDR5x memory). The core optimization goal is eliminating redundant memory copies during model loading — on unified memory, the standard ComfyUI loading pipeline creates 2-3x memory usage because it assumes separate RAM/VRAM pools.
 
 ## Common Commands
 
