@@ -375,6 +375,9 @@ class BaseModel(torch.nn.Module):
         # dtype reproduces assign=False copy semantics; skip for aimdo (mmap-backed
         # tensors) and quantized models (dequant + storage attributes).
         import comfy.memory_management
+        # UNIFIED_MEMORY here scopes the normalization only — the assign decision itself
+        # still comes from should_assign_weights() at the sd.py call sites. Keep this leg:
+        # direct assign=True callers off unified memory must stay upstream-identical.
         if (assign
                 and comfy.model_management.UNIFIED_MEMORY
                 and not comfy.memory_management.aimdo_enabled
@@ -384,7 +387,7 @@ class BaseModel(torch.nn.Module):
             targets = dict(self.diffusion_model.named_parameters())
             targets.update(dict(self.diffusion_model.named_buffers()))
             normalized = 0
-            for k, t in to_load.items():
+            for k, t in list(to_load.items()):
                 p = targets.get(k)
                 if (p is not None and hasattr(t, "dtype")
                         and t.dtype != p.dtype
