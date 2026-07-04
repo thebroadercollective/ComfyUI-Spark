@@ -306,7 +306,12 @@ class SDClipModel(torch.nn.Module, ClipTokenWeightEncoder):
         return self(tokens)
 
     def load_sd(self, sd):
-        return self.transformer.load_state_dict(sd, strict=False, assign=getattr(self, "can_assign_sd", False))
+        assign = getattr(self, "can_assign_sd", False)
+        # Identity check on purpose — mixed_precision_ops returns a *subclass* of
+        # manual_cast (ops.py:1165-1166); issubclass would wrongly include quant TEs.
+        if assign and self.operations is comfy.ops.manual_cast:
+            model_management.normalize_assign_state_dict_dtypes(self.transformer, sd, log_tag="TE_DTYPE_NORMALIZE")
+        return self.transformer.load_state_dict(sd, strict=False, assign=assign)
 
     def generate(self, tokens, do_sample, max_length, temperature, top_k, top_p, min_p, repetition_penalty, seed, presence_penalty=0.0):
         if isinstance(tokens, dict):

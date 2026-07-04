@@ -57,7 +57,10 @@ class ClipVisionModel():
         self.naf = None
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
+        assign = self.patcher.should_assign_weights()
+        if assign:
+            comfy.model_management.normalize_assign_state_dict_dtypes(self.model, sd, log_tag="CLIPVISION_DTYPE_NORMALIZE")
+        return self.model.load_state_dict(sd, strict=False, assign=assign)
 
     def get_sd(self):
         return self.model.state_dict()

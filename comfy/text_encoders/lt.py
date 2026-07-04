@@ -222,10 +222,18 @@ class LTXAVTEModel(torch.nn.Module):
         if len(sdo) == 0:
             sdo = sd
 
+        assign = getattr(self, "can_assign_sd", False)
+
+        def normalize_component_if_needed(component, component_sd):
+            # Identity check on purpose — see comment at the sd1_clip.py site.
+            if assign and self.gemma3_12b.operations is comfy.ops.manual_cast:
+                comfy.model_management.normalize_assign_state_dict_dtypes(component, component_sd, log_tag="TE_DTYPE_NORMALIZE")
+
         for prefix, component in [("text_embedding_projection.", self.text_embedding_projection)]:
             component_sd = {k.replace(prefix, ""): v for k, v in sdo.items() if k.startswith(prefix)}
             if component_sd:
-                missing, unexpected = component.load_state_dict(component_sd, strict=False, assign=getattr(self, "can_assign_sd", False))
+                normalize_component_if_needed(component, component_sd)
+                missing, unexpected = component.load_state_dict(component_sd, strict=False, assign=assign)
                 missing_all.extend([f"{prefix}{k}" for k in missing])
                 unexpected_all.extend([f"{prefix}{k}" for k in unexpected])
 
@@ -235,9 +243,11 @@ class LTXAVTEModel(torch.nn.Module):
                 if ww.shape[0] == 3840:
                     self.enable_compat_mode()
                     sdv = comfy.utils.state_dict_prefix_replace(sd, {"model.diffusion_model.video_embeddings_connector.": ""}, filter_keys=True)
-                    self.video_embeddings_connector.load_state_dict(sdv, strict=False, assign=getattr(self, "can_assign_sd", False))
+                    normalize_component_if_needed(self.video_embeddings_connector, sdv)
+                    self.video_embeddings_connector.load_state_dict(sdv, strict=False, assign=assign)
                     sda = comfy.utils.state_dict_prefix_replace(sd, {"model.diffusion_model.audio_embeddings_connector.": ""}, filter_keys=True)
-                    self.audio_embeddings_connector.load_state_dict(sda, strict=False, assign=getattr(self, "can_assign_sd", False))
+                    normalize_component_if_needed(self.audio_embeddings_connector, sda)
+                    self.audio_embeddings_connector.load_state_dict(sda, strict=False, assign=assign)
 
         return (missing_all, unexpected_all)
 

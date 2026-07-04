@@ -428,7 +428,12 @@ class CLIP:
 
     def load_sd(self, sd, full_model=False):
         if full_model:
-            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.should_assign_weights())
+            import comfy.ops
+            assign = self.patcher.should_assign_weights()
+            # Runs once per load; the attr-miss module walk cost is negligible.
+            if assign and all(getattr(m, "operations", comfy.ops.manual_cast) is comfy.ops.manual_cast for m in self.cond_stage_model.modules()):
+                model_management.normalize_assign_state_dict_dtypes(self.cond_stage_model, sd, log_tag="TE_DTYPE_NORMALIZE")
+            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=assign)
         else:
             can_assign = self.patcher.should_assign_weights()
             self.cond_stage_model.can_assign_sd = can_assign
