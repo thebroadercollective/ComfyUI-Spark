@@ -1136,6 +1136,31 @@ def archive_model_dtypes(model):
             setattr(module, f"{buf_name}_comfy_model_dtype", buf.dtype)
 
 
+def normalize_assign_state_dict_dtypes(module, state_dict, log_tag="DTYPE_NORMALIZE"):
+    """Pre-cast state-dict tensors whose dtype mismatches the matching named
+    param/buffer of `module`, so load_state_dict(assign=True) reproduces the
+    implicit dtype conversion of assign=False copy semantics. Unified-memory
+    only; inert when aimdo owns the state dict (mmap-backed tensors carry
+    storage attrs that .to() would strip). Mutates state_dict in place
+    (value replacement only). Returns the number of tensors cast."""
+    import comfy.memory_management
+    if not UNIFIED_MEMORY or comfy.memory_management.aimdo_enabled:
+        return 0
+    castable = (torch.float64, torch.float32, torch.float16, torch.bfloat16)
+    targets = dict(module.named_parameters())
+    targets.update(dict(module.named_buffers()))
+    normalized = 0
+    for k, t in list(state_dict.items()):
+        p = targets.get(k)
+        if (p is not None and hasattr(t, "dtype") and t.dtype != p.dtype
+                and t.dtype in castable and p.dtype in castable):
+            state_dict[k] = t.to(p.dtype)
+            normalized += 1
+    if normalized:
+        logging.info("%s %d mixed-dtype tensors cast to model dtype (assign=True)", log_tag, normalized)
+    return normalized
+
+
 def cleanup_models():
     to_delete = []
     for i in range(len(current_loaded_models)):

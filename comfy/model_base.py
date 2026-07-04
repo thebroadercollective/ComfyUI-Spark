@@ -373,29 +373,13 @@ class BaseModel(torch.nn.Module):
         # semantics). Mixed-dtype checkpoints produce mixed-dtype params, which break
         # models with disable_weight_init ops (no runtime casting). Pre-cast to model
         # dtype reproduces assign=False copy semantics; skip for aimdo (mmap-backed
-        # tensors) and quantized models (dequant + storage attributes).
-        import comfy.memory_management
-        # UNIFIED_MEMORY here scopes the normalization only — the assign decision itself
-        # still comes from should_assign_weights() at the sd.py call sites. Keep this leg:
-        # direct assign=True callers off unified memory must stay upstream-identical.
+        # tensors) and quantized models (dequant + storage attributes). The unified/aimdo
+        # gating lives inside normalize_assign_state_dict_dtypes() — the assign decision
+        # itself still comes from should_assign_weights() at the sd.py call sites.
         if (assign
-                and comfy.model_management.UNIFIED_MEMORY
-                and not comfy.memory_management.aimdo_enabled
                 and self.model_config.quant_config is None
                 and self.model_config.custom_operations is None):
-            _CASTABLE = (torch.float64, torch.float32, torch.float16, torch.bfloat16)
-            targets = dict(self.diffusion_model.named_parameters())
-            targets.update(dict(self.diffusion_model.named_buffers()))
-            normalized = 0
-            for k, t in list(to_load.items()):
-                p = targets.get(k)
-                if (p is not None and hasattr(t, "dtype")
-                        and t.dtype != p.dtype
-                        and t.dtype in _CASTABLE and p.dtype in _CASTABLE):
-                    to_load[k] = t.to(p.dtype)
-                    normalized += 1
-            if normalized:
-                logging.info("UNET_DTYPE_NORMALIZE %d mixed-dtype tensors cast to model dtype (assign=True)", normalized)
+            comfy.model_management.normalize_assign_state_dict_dtypes(self.diffusion_model, to_load, log_tag="UNET_DTYPE_NORMALIZE")
 
         m, u = self.diffusion_model.load_state_dict(to_load, strict=False, assign=assign)
         if len(m) > 0:
