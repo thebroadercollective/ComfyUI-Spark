@@ -5,6 +5,8 @@ from .spiece_tokenizer import SPieceTokenizer
 import comfy.text_encoders.genmo
 import torch
 import comfy.utils
+import comfy.ops
+import comfy.model_management
 import math
 import itertools
 

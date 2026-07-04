@@ -430,7 +430,7 @@ class CLIP:
         if full_model:
             import comfy.ops
             assign = self.patcher.should_assign_weights()
-            # Runs once per load; the attr-miss module walk cost is negligible.
+            # Intentionally coarse: one quant/custom-ops component skips normalization for the whole full-model load (conservative — skipping only costs memory parity, never correctness).
             if assign and all(getattr(m, "operations", comfy.ops.manual_cast) is comfy.ops.manual_cast for m in self.cond_stage_model.modules()):
                 model_management.normalize_assign_state_dict_dtypes(self.cond_stage_model, sd, log_tag="TE_DTYPE_NORMALIZE")
             return self.cond_stage_model.load_state_dict(sd, strict=False, assign=assign)
