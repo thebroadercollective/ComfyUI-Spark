@@ -394,4 +394,7 @@ else:
 def enables_dynamic_vram():
     if args.enable_dynamic_vram:
         return True
+    import comfy.spark_defaults  # lazy: this fn is called at main.py:57, pre-torch; keep torch-free
+    if comfy.spark_defaults.enabled():
+        return False
     return not args.disable_dynamic_vram and not args.highvram and not args.gpu_only and not args.novram and not args.cpu

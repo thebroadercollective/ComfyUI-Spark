@@ -306,6 +306,14 @@ if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supporte
         else:
             logging.warning("No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
 
+if comfy.model_management.UNIFIED_MEMORY and comfy.memory_management.aimdo_enabled and not args.enable_dynamic_vram:
+    logging.warning(
+        "SPARK: aimdo/DynamicVRAM is ENABLED on a unified-memory system without "
+        "--enable-dynamic-vram. This bypasses the fork's single-copy loader and "
+        "reintroduces 2x memory duplication. enables_dynamic_vram() gating may have "
+        "regressed (e.g. after an upstream rebase). Re-verify the spark_defaults clause."
+    )
+
 
 def cuda_malloc_warning():
     device = comfy.model_management.get_torch_device()
