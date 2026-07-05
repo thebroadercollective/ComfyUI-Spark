@@ -4,6 +4,9 @@ comfy.options.enable_args_parsing()
 from comfy.cli_args import args
 from comfy.cli_args import get_console_log_level, get_file_log_outputs
 
+import comfy.spark_defaults
+comfy.spark_defaults.apply_early(args)
+
 if args.list_feature_flags:
     import json
     from comfy_api.feature_flags import CLI_FEATURE_FLAG_REGISTRY
@@ -21,6 +24,7 @@ from app.logger import setup_logger
 console_log_level = get_console_log_level(args.verbose)
 file_log_outputs = get_file_log_outputs(args.verbose)
 setup_logger(log_level=console_log_level, file_outputs=file_log_outputs, use_stdout=args.log_stdout)
+comfy.spark_defaults.log_summary()
 
 from app.assets.seeder import asset_seeder
 from app.assets.services import register_output_files
