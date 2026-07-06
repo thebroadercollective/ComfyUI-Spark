@@ -12,6 +12,8 @@ class SPieceTokenizer:
         self.special_tokens = special_tokens
         import sentencepiece
         if torch.is_tensor(tokenizer_path):
+            # .cpu() before .numpy(): on unified memory safe_open(device="cuda") lands
+            # this vocab tensor on CUDA, where bare .numpy() raises. .cpu() is free here.
             tokenizer_path = tokenizer_path.cpu().numpy().tobytes()
 
         if isinstance(tokenizer_path, bytes):
