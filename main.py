@@ -306,7 +306,16 @@ if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supporte
         else:
             logging.warning("No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
 
-if comfy.model_management.UNIFIED_MEMORY and comfy.memory_management.aimdo_enabled and not args.enable_dynamic_vram:
+# Only warn when Spark defaults are ENABLED (auto/on): this check exists to catch
+# a post-rebase regression of enables_dynamic_vram()'s gating, and that gate only
+# applies when spark_defaults.enabled() is True. An explicit `--spark-defaults off`
+# opt-out running aimdo is correct stock behavior, not a regression.
+if (
+    comfy.model_management.UNIFIED_MEMORY
+    and comfy.memory_management.aimdo_enabled
+    and comfy.spark_defaults.enabled()
+    and not args.enable_dynamic_vram
+):
     logging.warning(
         "SPARK: aimdo/DynamicVRAM is ENABLED on a unified-memory system without "
         "--enable-dynamic-vram. This bypasses the fork's single-copy loader and "
