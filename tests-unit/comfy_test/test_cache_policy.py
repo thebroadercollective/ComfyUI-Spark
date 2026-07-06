@@ -1,14 +1,21 @@
 """Unit tests for comfy.cache_policy preset mapping, phase parsing, and watermark trigger."""
 
+import logging
+
 import pytest
 from unittest.mock import patch, MagicMock
 
+import comfy.cache_policy
+import comfy.model_management
+import comfy.memory_management
 from comfy.cache_policy import (
     CachePhase,
     _PRESET_PHASES,
     _PRESET_GC_PHASES,
     _parse_phase_override,
     _watermark_triggered,
+    _resolved_preset,
+    maybe_drop,
 )
 
 
@@ -105,3 +112,83 @@ class TestWatermarkTrigger:
 
         with patch("comfy.cache_policy.psutil.virtual_memory", side_effect=OSError("psutil broken")):
             assert _watermark_triggered() is False
+
+
+class TestResolvedPreset:
+    """--cache-aggressiveness None sentinel -> auto-resolved preset."""
+
+    def test_explicit_value_wins_even_on_unified(self, monkeypatch):
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = "normal"
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        assert _resolved_preset() == "normal"
+
+    def test_explicit_off_wins_even_on_unified(self, monkeypatch):
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = "off"
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        assert _resolved_preset() == "off"
+
+    def test_none_unified_no_aimdo_resolves_high(self, monkeypatch):
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        assert _resolved_preset() == "high"
+
+    def test_none_unified_with_aimdo_resolves_normal(self, monkeypatch):
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", True)
+
+        assert _resolved_preset() == "normal"
+
+    def test_none_non_unified_resolves_normal(self, monkeypatch):
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", False)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        assert _resolved_preset() == "normal"
+
+    def test_cache_drop_log_marks_auto_resolved_preset(self, monkeypatch, caplog):
+        """CACHE_DROP log should render 'high(auto)' when the raw arg was None."""
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = None
+        mock_args.cache_drop_at = None
+        mock_args.cache_drop_threshold_gb = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        with caplog.at_level(logging.INFO):
+            maybe_drop(CachePhase.POST_CHECKPOINT_LOAD, reason="test")
+
+        assert "preset=high(auto)" in caplog.text
+
+    def test_cache_drop_log_shows_plain_name_for_explicit_preset(self, monkeypatch, caplog):
+        """CACHE_DROP log should NOT append (auto) when the user passed an explicit value."""
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = "normal"
+        mock_args.cache_drop_at = None
+        mock_args.cache_drop_threshold_gb = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        with caplog.at_level(logging.INFO):
+            maybe_drop(CachePhase.POST_CHECKPOINT_LOAD, reason="test")
+
+        assert "preset=normal" in caplog.text
+        assert "preset=normal(auto)" not in caplog.text

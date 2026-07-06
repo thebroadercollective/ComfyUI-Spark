@@ -20,6 +20,7 @@ import gc
 import logging
 import psutil
 
+import comfy.memory_management
 import comfy.model_management as mm
 from comfy.cli_args import _VALID_CACHE_PHASES as _cli_valid
 from comfy.cli_args import args
@@ -92,6 +93,22 @@ for _preset_name, _gc_set in _PRESET_GC_PHASES.items():
     )
 
 
+def _resolved_preset() -> str:
+    """Resolve the --cache-aggressiveness sentinel (None) to a concrete preset.
+
+    None (the default) means 'auto': 'high' on unified-memory systems that are NOT
+    running upstream's aimdo loader, 'normal' everywhere else. An explicit user value
+    always wins. Do NOT rely on _PRESET_PHASES.get(None, ...) silently degrading —
+    resolve the sentinel here so both the phase lookups and the log agree.
+    """
+    preset = getattr(args, "cache_aggressiveness", None)
+    if preset is not None:
+        return preset
+    if mm.UNIFIED_MEMORY and not comfy.memory_management.aimdo_enabled:
+        return "high"
+    return "normal"
+
+
 # Module-level tracker so maybe_drop() logs at-most-once per phase on failure.
 _drop_failures_seen: set[CachePhase] = set()
 
@@ -143,7 +160,7 @@ def _active_phases() -> frozenset[CachePhase]:
     override = _get_override_phases()
     if override is not None:
         return override
-    preset = getattr(args, "cache_aggressiveness", "normal")
+    preset = _resolved_preset()
     return _PRESET_PHASES.get(preset, _PRESET_PHASES["normal"])
 
 
@@ -155,7 +172,7 @@ def _gc_phases() -> frozenset[CachePhase]:
         # phase list are debugging and want the full hammer. (This behavior
         # is documented in the --cache-drop-at help text.)
         return override
-    preset = getattr(args, "cache_aggressiveness", "normal")
+    preset = _resolved_preset()
     return _PRESET_GC_PHASES.get(preset, _PRESET_GC_PHASES["normal"])
 
 
@@ -207,7 +224,9 @@ def _maybe_drop_impl(phase: CachePhase, *, reason: str = "") -> None:
         gc.collect()
     after = mm.memory_report()
 
-    preset_name = getattr(args, "cache_aggressiveness", "normal")
+    raw_preset = getattr(args, "cache_aggressiveness", None)
+    resolved_preset = _resolved_preset()
+    preset_name = f"{resolved_preset}(auto)" if raw_preset is None else resolved_preset
     logging.info(
         "CACHE_DROP phase=%s preset=%s trigger=%s%s gc=%s | %s",
         phase.value,

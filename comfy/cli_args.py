@@ -229,11 +229,12 @@ parser.add_argument(
     "--cache-aggressiveness",
     type=str,
     choices=["off", "low", "normal", "high", "paranoid"],
-    default="normal",
+    default=None,
     help="Cache drop aggressiveness preset for the model loader. off = no drops; "
          "low = one drop at checkpoint-load; normal = drops at checkpoint-load and "
-         "pre-inference (default); high = adds post-file-load and post-model-init; "
-         "paranoid = every phase (debugging only, slow).",
+         "pre-inference; high = adds post-file-load and post-model-init; "
+         "paranoid = every phase (debugging only, slow). "
+         "Default: auto (high on DGX Spark unified memory, normal elsewhere).",
 )
 
 parser.add_argument(
