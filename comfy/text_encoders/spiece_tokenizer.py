@@ -12,7 +12,7 @@ class SPieceTokenizer:
         self.special_tokens = special_tokens
         import sentencepiece
         if torch.is_tensor(tokenizer_path):
-            tokenizer_path = tokenizer_path.numpy().tobytes()
+            tokenizer_path = tokenizer_path.cpu().numpy().tobytes()
 
         if isinstance(tokenizer_path, bytes):
             self.tokenizer = sentencepiece.SentencePieceProcessor(model_proto=tokenizer_path, add_bos=self.add_bos, add_eos=self.add_eos)
