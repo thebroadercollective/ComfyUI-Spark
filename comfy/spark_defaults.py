@@ -130,10 +130,17 @@ def apply_early(args) -> None:
     # Descriptive summary of every GB10 auto-default this feature applies across
     # all tasks (A: CUDA_CACHE_MAXSIZE; B/C/D: dynamic-vram/reserve-vram/pinned-
     # memory/bf16-text-enc/cache-aggressiveness), so a user reading the startup
-    # log knows what changed.
+    # log knows what changed. This function runs pre-torch and gates on
+    # enabled() alone -- it cannot read UNIFIED_MEMORY (set later, at
+    # comfy.model_management import time). reserve-vram, pinned-memory-off,
+    # bf16-text-enc, and cache-aggressiveness-high additionally require
+    # UNIFIED_MEMORY at their consumer call sites, so the wording below must not
+    # claim they always apply -- only dynamic-vram-off and CUDA_CACHE_MAXSIZE are
+    # unconditional on enabled() alone.
     _summary = (
-        "CUDA_CACHE_MAXSIZE=4294967296, dynamic-vram off, reserve-vram 1GB, "
-        "pinned-memory off, bf16-text-enc, cache-aggressiveness high"
+        "CUDA_CACHE_MAXSIZE=4294967296 and dynamic-VRAM off; and, when unified "
+        "memory is active, reserve-vram 1GB, pinned-memory off, bf16-text-enc, "
+        "and cache-aggressiveness high"
     )
 
 

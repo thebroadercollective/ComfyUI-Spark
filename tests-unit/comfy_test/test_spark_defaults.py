@@ -206,7 +206,14 @@ class TestNoTorchImport:
         """spark_defaults must stay import-cheap: no real import statement may
         pull in torch, comfy.model_management, or comfy.cache_policy (mentions in
         prose/comments are fine and expected -- this module documents why it
-        avoids them)."""
+        avoids them).
+
+        Generalized to reject ANY real import line containing the "torch" token
+        (e.g. "import torch as t", "from torch import nn"), not just an exact
+        "import torch" match -- an exact-match check would miss those variants.
+        Docstrings/comments are excluded by only inspecting lines that start
+        with "import " or "from ".
+        """
         src_path = comfy.spark_defaults.__file__
         with open(src_path) as f:
             lines = f.readlines()
@@ -214,6 +221,6 @@ class TestNoTorchImport:
             stripped = line.strip()
             if not (stripped.startswith("import ") or stripped.startswith("from ")):
                 continue
-            assert stripped != "import torch", stripped
+            assert "torch" not in stripped, stripped
             assert "comfy.model_management" not in stripped, stripped
             assert "comfy.cache_policy" not in stripped, stripped

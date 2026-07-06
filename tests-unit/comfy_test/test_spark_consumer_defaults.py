@@ -65,6 +65,18 @@ class TestTextEncoderDtypeGate:
         monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         assert comfy.model_management.text_encoder_dtype(device=None) == torch.float16
 
+    def test_gate_on_explicit_fp8_e4m3fn_flag_still_wins(self, monkeypatch):
+        _set_te_flags(monkeypatch, fp8_e4m3fn=True)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
+        assert comfy.model_management.text_encoder_dtype(device=None) == torch.float8_e4m3fn
+
+    def test_gate_on_explicit_fp8_e5m2_flag_still_wins(self, monkeypatch):
+        _set_te_flags(monkeypatch, fp8_e5m2=True)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
+        assert comfy.model_management.text_encoder_dtype(device=None) == torch.float8_e5m2
+
     def test_gate_on_explicit_fp32_flag_still_wins(self, monkeypatch):
         _set_te_flags(monkeypatch, fp32=True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
