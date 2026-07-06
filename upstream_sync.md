@@ -90,6 +90,47 @@ The fork's `feat(memory)` commits inject memory-accounting logging (`CHECKPOINT 
 
 **Pattern for all three:** the fork only ever *adds logging lines and the `should_assign_weights()` call*; everything else in these hunks is upstream code the fork happened to carry. Take upstream's version of the surrounding logic, re-insert the fork's logging/`should_assign_weights()`.
 
+### GB10 auto-defaults (`comfy/spark_defaults.py` + consumer gates) — new rebase-risk locus
+
+Added by the GB10-auto-defaults feature (`feat/gb10-auto-defaults`, base `3f4185fd`; see
+`dev-docs/gb10-auto-defaults.md` for the full design). Sits in the same rebase-risk loci as
+the invertible-LoRA (`model_patcher.py`) and observability-logging (`sd.py`) conflicts above
+— re-verify all three of the following after every sync, not just on conflict:
+
+1. **`comfy.cli_args.enables_dynamic_vram()`** still short-circuits to `False` when
+   `comfy.spark_defaults.enabled()` is `True`, with `args.enable_dynamic_vram` winning
+   first (checked before the `spark_defaults` clause, unconditionally). If a rebase
+   reworks this function's body (e.g. upstream adds a new VRAM-mode flag to the legacy
+   fallback expression), the `spark_defaults.enabled()` short-circuit must stay intact and
+   still precede that expression — it must never read `args.disable_dynamic_vram` on the
+   GB10 path, or the deprecation-proofing is defeated.
+2. **The `main.py` aimdo self-check WARNING** (placed right after the aimdo-activation `if
+   args.enable_dynamic_vram or (enables_dynamic_vram() and ...):` block) survived the
+   rebase, and its condition still includes all four of
+   `comfy.model_management.UNIFIED_MEMORY`, `comfy.memory_management.aimdo_enabled`,
+   `comfy.spark_defaults.enabled()`, and `not args.enable_dynamic_vram`. Losing the
+   `spark_defaults.enabled()` guard specifically reintroduces a false positive on
+   `--spark-defaults off` (the bug fixed in `4ccf603b`).
+3. **The consumer-side gates are intact**: the `elif UNIFIED_MEMORY and
+   comfy.spark_defaults.enabled():` arm on `EXTRA_RESERVED_VRAM` in
+   `model_management.py`; `pinned_memory_disabled()` (`model_management.py`) still OR'd
+   into all three read sites (`model_management.py`'s `MAX_PINNED_MEMORY` guard,
+   `comfy/pinned_memory.py`'s `get_pin`/`pin_memory`); the `text_encoder_dtype()` bf16
+   clause in `model_management.py` still sits after the five explicit dtype-flag `elif`s;
+   and `comfy/cache_policy.py::_resolved_preset()`'s auto-`high` branch still requires
+   `comfy.spark_defaults.enabled()` in addition to `mm.UNIFIED_MEMORY and not
+   comfy.memory_management.aimdo_enabled` (losing just this `enabled()` clause silently
+   breaks `--spark-defaults off`'s uniformity — the bug fixed in `42c2d483`).
+
+Quick post-rebase spot-check:
+
+```bash
+uv run python -m pytest tests-unit/comfy_test/test_spark_defaults.py \
+  tests-unit/comfy_test/test_dynamic_vram_gate.py \
+  tests-unit/comfy_test/test_spark_consumer_defaults.py \
+  tests-unit/comfy_test/test_cache_policy.py -q
+```
+
 ## After the rebase
 
 Restore the `models` symlink and pop any stash (above), then verify before trusting the result:
