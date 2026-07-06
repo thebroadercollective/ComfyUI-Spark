@@ -22,6 +22,7 @@ import psutil
 
 import comfy.memory_management
 import comfy.model_management as mm
+import comfy.spark_defaults
 from comfy.cli_args import _VALID_CACHE_PHASES as _cli_valid
 from comfy.cli_args import args
 
@@ -96,15 +97,23 @@ for _preset_name, _gc_set in _PRESET_GC_PHASES.items():
 def _resolved_preset() -> str:
     """Resolve the --cache-aggressiveness sentinel (None) to a concrete preset.
 
-    None (the default) means 'auto': 'high' on unified-memory systems that are NOT
-    running upstream's aimdo loader, 'normal' everywhere else. An explicit user value
-    always wins. Do NOT rely on _PRESET_PHASES.get(None, ...) silently degrading —
-    resolve the sentinel here so both the phase lookups and the log agree.
+    None (the default) means 'auto': 'high' when Spark auto-defaults are enabled
+    (comfy.spark_defaults.enabled(), i.e. the --spark-defaults kill-switch is not
+    "off") AND the system is unified-memory AND NOT running upstream's aimdo
+    loader; 'normal' everywhere else -- including when --spark-defaults off is
+    passed, which must restore stock upstream behavior end-to-end. An explicit
+    user value always wins. Do NOT rely on _PRESET_PHASES.get(None, ...) silently
+    degrading -- resolve the sentinel here so both the phase lookups and the log
+    agree.
     """
     preset = getattr(args, "cache_aggressiveness", None)
     if preset is not None:
         return preset
-    if mm.UNIFIED_MEMORY and not comfy.memory_management.aimdo_enabled:
+    if (
+        comfy.spark_defaults.enabled()
+        and mm.UNIFIED_MEMORY
+        and not comfy.memory_management.aimdo_enabled
+    ):
         return "high"
     return "normal"
 

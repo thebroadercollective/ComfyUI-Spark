@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 import comfy.cache_policy
 import comfy.model_management
 import comfy.memory_management
+import comfy.spark_defaults
 from comfy.cache_policy import (
     CachePhase,
     _PRESET_PHASES,
@@ -121,6 +122,7 @@ class TestResolvedPreset:
         mock_args = MagicMock()
         mock_args.cache_aggressiveness = "normal"
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
@@ -130,34 +132,51 @@ class TestResolvedPreset:
         mock_args = MagicMock()
         mock_args.cache_aggressiveness = "off"
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
         assert _resolved_preset() == "off"
 
-    def test_none_unified_no_aimdo_resolves_high(self, monkeypatch):
+    def test_none_spark_defaults_enabled_unified_no_aimdo_resolves_high(self, monkeypatch):
         mock_args = MagicMock()
         mock_args.cache_aggressiveness = None
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
         assert _resolved_preset() == "high"
 
-    def test_none_unified_with_aimdo_resolves_normal(self, monkeypatch):
+    def test_none_spark_defaults_enabled_unified_with_aimdo_resolves_normal(self, monkeypatch):
         mock_args = MagicMock()
         mock_args.cache_aggressiveness = None
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", True)
 
         assert _resolved_preset() == "normal"
 
-    def test_none_non_unified_resolves_normal(self, monkeypatch):
+    def test_none_spark_defaults_enabled_non_unified_resolves_normal(self, monkeypatch):
         mock_args = MagicMock()
         mock_args.cache_aggressiveness = None
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", False)
+        monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
+
+        assert _resolved_preset() == "normal"
+
+    def test_none_spark_defaults_disabled_unified_no_aimdo_resolves_normal(self, monkeypatch):
+        """KEY: --spark-defaults off must restore stock ('normal') behavior even
+        though UNIFIED_MEMORY is True and aimdo is not running -- this is the
+        kill-switch consistency bug this fix pass addresses."""
+        mock_args = MagicMock()
+        mock_args.cache_aggressiveness = None
+        monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: False)
+        monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
         assert _resolved_preset() == "normal"
@@ -169,6 +188,7 @@ class TestResolvedPreset:
         mock_args.cache_drop_at = None
         mock_args.cache_drop_threshold_gb = None
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
@@ -184,6 +204,7 @@ class TestResolvedPreset:
         mock_args.cache_drop_at = None
         mock_args.cache_drop_threshold_gb = None
         monkeypatch.setattr(comfy.cache_policy, "args", mock_args)
+        monkeypatch.setattr(comfy.spark_defaults, "enabled", lambda: True)
         monkeypatch.setattr(comfy.model_management, "UNIFIED_MEMORY", True)
         monkeypatch.setattr(comfy.memory_management, "aimdo_enabled", False)
 
