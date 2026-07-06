@@ -33,6 +33,7 @@ import comfy.memory_management
 import comfy.system_memory
 import comfy.utils
 import comfy.quant_ops
+import comfy.spark_defaults
 import comfy_aimdo.host_buffer
 import comfy_aimdo.vram_buffer
 from comfy.internal_logging import detail
@@ -608,6 +609,17 @@ if UNIFIED_MEMORY:
     logging.info("Unified memory system detected, enabling optimizations")
     logging.info("Unified memory: page cache drop auto-enabled")
 
+if comfy.spark_defaults.detect_gb10() != UNIFIED_MEMORY:
+    logging.warning(
+        "SPARK: probe disagreement — spark_defaults.detect_gb10()=%s but "
+        "is_unified_memory_system()=%s. The torch-free GB10 probe and the sm_121 "
+        "unified check disagree; auto-defaults gating may be inconsistent.",
+        comfy.spark_defaults.detect_gb10(), UNIFIED_MEMORY,
+    )
+
+def pinned_memory_disabled():
+    return args.disable_pinned_memory or (UNIFIED_MEMORY and comfy.spark_defaults.enabled())
+
 def get_torch_device_name(device):
     if hasattr(device, 'type'):
         if device.type == "cuda":
@@ -876,6 +888,9 @@ if WINDOWS:
 if args.reserve_vram is not None:
     EXTRA_RESERVED_VRAM = args.reserve_vram * 1024 * 1024 * 1024
     logging.debug("Reserving {}MB vram for other applications.".format(EXTRA_RESERVED_VRAM / (1024 * 1024)))
+elif UNIFIED_MEMORY and comfy.spark_defaults.enabled():
+    EXTRA_RESERVED_VRAM = 1 * 1024 ** 3
+    logging.info("SPARK: reserve-vram auto-set to 1GB (unified memory)")
 
 def extra_reserved_memory():
     return EXTRA_RESERVED_VRAM
@@ -1349,6 +1364,9 @@ def text_encoder_dtype(device=None):
     elif args.fp32_text_enc:
         return torch.float32
 
+    if UNIFIED_MEMORY and comfy.spark_defaults.enabled():
+        return torch.bfloat16
+
     if is_device_cpu(device):
         return torch.float16
 
@@ -1705,7 +1723,7 @@ def get_disk_swap_total():
         logging.warning("Could not get amount of swap memory on system.")
     return total
 
-if not args.disable_pinned_memory:
+if not pinned_memory_disabled():
     if is_nvidia() or is_amd():
         ram = get_total_memory(torch.device("cpu"))
         if WINDOWS:
@@ -1714,6 +1732,8 @@ if not args.disable_pinned_memory:
             swap = 0 if comfy.system_memory.cgroup_memory_limit() is not None else get_disk_swap_total()
             MAX_PINNED_MEMORY = max(ram * 0.40, min(ram * 0.90, ram - 4 * 1024 ** 3, ram + swap - 16 * 1024 ** 3))
         logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
+elif UNIFIED_MEMORY and comfy.spark_defaults.enabled():
+    logging.info("SPARK: pinned memory auto-disabled (unified memory)")
 
 PINNING_ALLOWED_TYPES = set(["Tensor", "Parameter", "QuantizedTensor"])
 
