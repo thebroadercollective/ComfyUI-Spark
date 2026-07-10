@@ -52,7 +52,14 @@ def _add_entry(cache, key, outputs, generation, ts):
 @pytest.fixture
 def model_patcher_mock():
     # MagicMock(spec=ModelPatcher) sets __class__, so isinstance(...) passes.
-    return MagicMock(spec=ModelPatcher)
+    m = MagicMock(spec=ModelPatcher)
+    # The fork runs --disable-dynamic-vram, so real ModelPatchers are non-dynamic
+    # (is_dynamic() -> False). Pin it here: without this a spec'd mock's is_dynamic()
+    # returns a truthy MagicMock, which trips upstream's all_outputs_dynamic() guard
+    # (which protects current-gen *dynamic* outputs) and masks the fork's own
+    # unified-memory ModelPatcher guard under test.
+    m.is_dynamic.return_value = False
+    return m
 
 
 def _force_unrelieved_pressure(monkeypatch):
