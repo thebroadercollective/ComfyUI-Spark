@@ -1,6 +1,7 @@
 import torch
 from tokenizers import Tokenizer
 
+import comfy.model_management
 import comfy.ops
 from comfy.ldm.minimax_music.ar import CFG_SCALE, CFG_TOP_K, MAX_AUDIO_FRAMES, MiniMaxMusic3AR
 from comfy.ldm.minimax_music.prompt import SPECIAL_TOKEN_IDS, build_prompt
@@ -73,6 +74,9 @@ class MiniMaxMusic3TEModel(MiniMaxMusic3AR):
         if operations is None:
             operations = comfy.ops.mixed_precision_ops(quant_config, dtype) if quant_config is not None else comfy.ops.manual_cast
         super().__init__({**MODEL_CONFIG, **(projection_config or {})}, dtype, device, operations)
+        # SPARK: MiniMaxMusic3AR does not retain `operations`; keep a handle so
+        # load_state_dict can gate the unified-memory dtype normalization on it.
+        self.operations = operations
         self.dtypes = {dtype}
         self.execution_device = device
 
@@ -111,6 +115,12 @@ class MiniMaxMusic3TEModel(MiniMaxMusic3AR):
                 del self.model.lm_head
             else:
                 del self.model.lm_head_pruned
+        # SPARK: normalize mixed checkpoint dtypes before an assign=True load, which
+        # would otherwise preserve them verbatim (see CLAUDE.md). Runs *after* the
+        # pruned-embedding/lm-head deletions above so it only sees live parameters.
+        # Identity check on purpose — see comment at the sd1_clip.py site.
+        if assign and getattr(self, "operations", None) is comfy.ops.manual_cast:
+            comfy.model_management.normalize_assign_state_dict_dtypes(self, state_dict, log_tag="TE_DTYPE_NORMALIZE")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def load_sd(self, state_dict):
