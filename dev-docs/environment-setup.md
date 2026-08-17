@@ -59,6 +59,23 @@ Evidence (2026-05-30): the installed versions match the **pyproject** pins, not
 | comfyui-embedded-docs | 0.4.3 | 0.5.1 |
 | comfy-aimdo | 0.4.7 (from `>=0.2.12`) | ==0.4.5 |
 
+Updated (2026-08-16, after the v0.33.0 sync): `comfyui-frontend-package` is now
+reconciled with upstream at **1.49.6** (it had fallen seven minor versions behind
+the backend). The rest of the table still drifts by design:
+
+| Package | Installed (= pyproject) | requirements.txt says |
+|---|---|---|
+| comfyui-frontend-package | **1.49.6** | 1.49.6 (reconciled) |
+| comfyui-workflow-templates | 0.9.44 | 0.11.41 |
+| comfyui-embedded-docs | 0.4.3 | 0.5.10 |
+| comfy-aimdo | 0.4.10 (from `>=0.2.12`) | ==0.4.13 |
+
+`comfy-aimdo` is deliberately not chased — aimdo/DynamicVRAM is off on GB10 (see
+CLAUDE.md), so only its import-time API surface matters. `comfy-kitchen` was
+raised to `>=0.2.31` during the same sync because `comfy/ldm/modules/attention.py`
+now calls `comfy_kitchen.int8_attention_is_available()` at import time, and
+`comfy-angle` was added because `comfy_extras/nodes_glsl.py` imports it.
+
 So treat `requirements.txt` as **vestigial upstream baggage**. It is kept for
 compatibility with stock-ComfyUI tooling but does **not** describe this env. Don't
 `uv pip install -r requirements.txt` — it would fight the locked versions.

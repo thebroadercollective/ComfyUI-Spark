@@ -15,7 +15,7 @@ dependencies = [
     "comfy-angle>=0.1.0",
     "comfy-kitchen>=0.2.31",
     "comfyui-embedded-docs==0.4.3",
-    "comfyui-frontend-package==1.42.8",
+    "comfyui-frontend-package==1.49.6",
     "comfyui-workflow-templates==0.9.44",
     "einops>=0.8.2",
     "filelock>=3.25.2",
