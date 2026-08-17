@@ -527,7 +527,7 @@ def _outputs_contain_model_patcher(outputs):
         if isinstance(output, (list, tuple)):
             if _outputs_contain_model_patcher(output):
                 return True
-        elif isinstance(output, ModelPatcher):
+        elif is_model_patcher_output(output):
             return True
     return False
 
