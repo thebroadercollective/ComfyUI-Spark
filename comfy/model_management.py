@@ -1319,8 +1319,15 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
 def text_encoder_offload_device():
     if args.gpu_only:
         return get_torch_device()
-    else:
-        return torch.device("cpu")
+    if UNIFIED_MEMORY and not is_device_cpu(text_encoder_device()):
+        # See unet_offload_device(): on unified memory, "offloading" a
+        # GPU-resident text encoder to cpu allocates a second copy of its
+        # weights in the same physical pool (sampler-time free_memory copying
+        # the 33G mistral TE cpu-ward drove swap/OOM). Keep offload == load so
+        # the unload is a no-op; explicit-CPU placements (--cpu-text-enc, node
+        # device="cpu") resolve a cpu load device and keep a cpu offload.
+        return get_torch_device()
+    return torch.device("cpu")
 
 def text_encoder_device():
     if args.cpu_text_enc:
