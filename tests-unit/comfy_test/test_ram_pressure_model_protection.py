@@ -14,7 +14,6 @@ ModelPatchers, so the active patcher scored as a tiny default entry and got swep
 Fix: on unified memory, ram_release must never evict a current-generation entry that
 holds a ModelPatcher, while still evicting CPU-tensor outputs (the real relief valve).
 """
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,12 +62,13 @@ def model_patcher_mock():
 
 
 def _force_unrelieved_pressure(monkeypatch):
-    # Simulate the unified false-pressure signal: psutil.available never rises even as
+    # Simulate the unified false-pressure signal: available RAM never rises even as
     # entries are evicted (freed weights sit in torch's CUDA reserved cache). This is
     # what drove the eviction loop past the CPU tensors and into the resident model.
-    monkeypatch.setattr(
-        caching.psutil, "virtual_memory", lambda: SimpleNamespace(available=0)
-    )
+    # NOTE: upstream 77739723 routed ram_release() through
+    # comfy.system_memory.virtual_memory_available() (cgroup-aware) instead of calling
+    # psutil.virtual_memory() directly, so patch the name caching.py actually reads.
+    monkeypatch.setattr(caching, "virtual_memory_available", lambda: 0)
 
 
 def test_ram_release_protects_current_gen_model_on_unified(monkeypatch, model_patcher_mock):
