@@ -8,7 +8,7 @@ gc.collect() during the load path. Three layered controls:
   plus a POST_CHECKPOINT_LOAD drop and a PRE_INFERENCE drop.
 - Explicit phase list via --cache-drop-at overrides the preset if provided.
 - A pressure-driven watermark via --cache-drop-threshold-gb fires on any
-  registered phase regardless of preset when psutil.virtual_memory().available
+  registered phase regardless of preset when available system memory
   falls below the threshold.
 
 Call sites invoke maybe_drop(CachePhase.X, reason=...) at known phase
@@ -18,11 +18,11 @@ boundaries. This file owns the policy; call sites land in T5.
 import enum
 import gc
 import logging
-import psutil
 
 import comfy.memory_management
 import comfy.model_management as mm
 import comfy.spark_defaults
+import comfy.system_memory
 from comfy.cli_args import _VALID_CACHE_PHASES as _cli_valid
 from comfy.cli_args import args
 
@@ -197,7 +197,12 @@ def _watermark_triggered() -> bool:
     if threshold is None:
         return False
     try:
-        return psutil.virtual_memory().available < threshold
+        # Upstream 77739723 made comfy.system_memory the single source of truth for
+        # "how much RAM can this process actually still use" (it honors a container
+        # cgroup limit instead of reporting host RAM). Read through it so the
+        # watermark agrees with load_models_gpu / ram_release under a cgroup cap.
+        # Passthrough to psutil on bare metal, which is the Spark case.
+        return comfy.system_memory.virtual_memory_available() < threshold
     except Exception:
         return False
 

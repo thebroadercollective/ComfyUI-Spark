@@ -78,9 +78,8 @@ class TestWatermarkTrigger:
         mock_args.cache_drop_at = None
         monkeypatch.setattr("comfy.cache_policy.args", mock_args)
 
-        mock_vm = MagicMock()
-        mock_vm.available = 10 * 1024**3  # 10GB
-        with patch("comfy.cache_policy.psutil.virtual_memory", return_value=mock_vm):
+        with patch("comfy.cache_policy.comfy.system_memory.virtual_memory_available",
+                   return_value=10 * 1024**3):  # 10GB
             assert _watermark_triggered() is True
 
     def test_watermark_does_not_trigger_when_above_threshold(self, monkeypatch):
@@ -90,9 +89,8 @@ class TestWatermarkTrigger:
         mock_args.cache_drop_at = None
         monkeypatch.setattr("comfy.cache_policy.args", mock_args)
 
-        mock_vm = MagicMock()
-        mock_vm.available = 30 * 1024**3  # 30GB (above 20GB)
-        with patch("comfy.cache_policy.psutil.virtual_memory", return_value=mock_vm):
+        with patch("comfy.cache_policy.comfy.system_memory.virtual_memory_available",
+                   return_value=30 * 1024**3):  # 30GB (above 20GB)
             assert _watermark_triggered() is False
 
     def test_watermark_inactive_when_threshold_not_set(self, monkeypatch):
@@ -104,14 +102,15 @@ class TestWatermarkTrigger:
 
         assert _watermark_triggered() is False
 
-    def test_watermark_returns_false_on_psutil_error(self, monkeypatch):
+    def test_watermark_returns_false_on_memory_probe_error(self, monkeypatch):
         mock_args = MagicMock()
         mock_args.cache_drop_threshold_gb = 20.0
         mock_args.cache_aggressiveness = "normal"
         mock_args.cache_drop_at = None
         monkeypatch.setattr("comfy.cache_policy.args", mock_args)
 
-        with patch("comfy.cache_policy.psutil.virtual_memory", side_effect=OSError("psutil broken")):
+        with patch("comfy.cache_policy.comfy.system_memory.virtual_memory_available",
+                   side_effect=OSError("memory probe broken")):
             assert _watermark_triggered() is False
 
 

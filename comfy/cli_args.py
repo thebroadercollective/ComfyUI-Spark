@@ -254,7 +254,7 @@ parser.add_argument(
     default=None,
     metavar="GB",
     help="Memory-pressure watermark: drop caches (with gc.collect) at any phase "
-         "hook when psutil.virtual_memory().available falls below this threshold. "
+         "hook when available system memory falls below this threshold. "
          "Orthogonal to --cache-aggressiveness. Default: unset (watermark inactive).",
 )
 
