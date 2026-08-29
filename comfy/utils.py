@@ -216,7 +216,11 @@ def _stream_safetensors_to_device(ckpt, basename, total_size, load_start_time, r
         # Bounds-check the untrusted header length BEFORE allocating it — a corrupt u64 would
         # otherwise trigger a huge bytearray alloc (MemoryError) on the shared pool. Out-of-range
         # -> clean ValueError -> caller's safe_open fallback (which rejects it identically).
-        if hdr_len <= 0 or 8 + hdr_len > total_size:
+        # _SAFETENSORS_MAX_HEADER_SIZE mirrors the cap safetensors itself enforces (upstream
+        # a3e5cce5 applies the same constant on the aimdo path); without it the streamer would
+        # accept — and pread whole — a multi-hundred-MB header that safe_open rejects as
+        # "HeaderTooLarge", so the two paths would disagree on what is a valid file.
+        if hdr_len <= 0 or 8 + hdr_len > total_size or hdr_len > _SAFETENSORS_MAX_HEADER_SIZE:
             raise ValueError("invalid safetensors header length {} (file size {})".format(hdr_len, total_size))
         header = json.loads(os.pread(fd, hdr_len, 8))
         data_base = 8 + hdr_len

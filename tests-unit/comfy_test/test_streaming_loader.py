@@ -128,6 +128,29 @@ class TestStreamingCpuTarget:
             U._stream_safetensors_to_device(
                 path, "corrupt_hdr", os.path.getsize(path), time.perf_counter(), False, "cpu")
 
+    def test_bounds_check_rejects_oversized_header(self, tmp_path):
+        """A header longer than _SAFETENSORS_MAX_HEADER_SIZE must be rejected even when it fits
+        inside the file, so the streamer and safe_open agree on what is a valid file.
+
+        Upstream a3e5cce5 added the 100MB cap (safetensors raises "HeaderTooLarge" past it) and
+        applied it on the aimdo path. Without the same cap here, a large file declaring e.g. a
+        200MB header would be pread whole by the streamer and accepted if the JSON parsed, while
+        safe_open rejects it -- a silent divergence between the two load paths.
+        """
+        import time
+        import comfy.utils as U
+
+        # Declare a header length just past the cap. total_size is passed in (the streamer trusts
+        # its caller for that), so this needs no multi-hundred-MB file on disk: the cap is checked
+        # before any pread of the header body.
+        path = _save(tmp_path, "big_hdr.safetensors", {"x": torch.randn(8, 8)})
+        oversized = U._SAFETENSORS_MAX_HEADER_SIZE + 1
+        with open(path, "r+b") as f:
+            f.write(struct.pack("<Q", oversized))
+        with pytest.raises(ValueError, match="invalid safetensors header length"):
+            U._stream_safetensors_to_device(
+                path, "big_hdr", 8 + oversized + 1024, time.perf_counter(), False, "cpu")
+
     def test_bounds_check_rejects_corrupt_offsets(self, tmp_path):
         """A per-tensor data_offset that runs past the file must raise ValueError (clean
         fallback) rather than a bare short-read/negative-alloc. Runs without CUDA.
