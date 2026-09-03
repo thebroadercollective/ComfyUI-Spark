@@ -229,6 +229,24 @@ def z_image_convert(sd):
 
     return out_sd
 
+def normalize_model_patch_state_dict(model, sd, assign, quantized):
+    """SPARK: pre-cast mixed-dtype MODEL_PATCH tensors before load_state_dict(assign=True).
+
+    Every branch of ModelPatchLoader except the MiniMax H3 Fun one hardcodes
+    comfy.ops.manual_cast (runtime cast, crash-safe). That branch resolves ops via
+    pick_operations(), which on GB10 returns disable_weight_init for a natively
+    supported bf16 checkpoint -- no runtime cast -- so a mixed-dtype checkpoint would
+    raise the Krea-2-turbo-class dtype RuntimeError. `quantized` skips checkpoints
+    whose packed weights / dequant scales must reach mixed_precision_ops untouched;
+    the unified-memory and aimdo gates live inside the helper.
+    """
+    if not assign or quantized:
+        return 0
+    return comfy.model_management.normalize_assign_state_dict_dtypes(
+        model, sd, log_tag="MODEL_PATCH_DTYPE_NORMALIZE"
+    )
+
+
 class ModelPatchLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -244,6 +262,7 @@ class ModelPatchLoader:
         model_patch_path = folder_paths.get_full_path_or_raise("model_patches", name)
         sd, metadata = comfy.utils.load_torch_file(model_patch_path, safe_load=True, return_metadata=True)
         dtype = comfy.utils.weight_dtype(sd)
+        quantized = False  # SPARK: set by any branch using quantized ops; see normalize_model_patch_state_dict
 
         if 'lllite_conditioning1.conv1.weight' in sd:
             model = comfy.ldm.anima.lllite.AnimaLLLite(sd, metadata, device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast)
@@ -275,6 +294,7 @@ class ModelPatchLoader:
             if quant is not None:
                 dtype = torch.bfloat16
                 operations = comfy.ops.mixed_precision_ops(quant, dtype)
+                quantized = True
             else:
                 dtype = comfy.model_management.unet_dtype(
                     model_params=-1,
@@ -377,7 +397,9 @@ class ModelPatchLoader:
                 model.denoise_encoder_sd = denoise_encoder_sd
 
         model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=comfy.model_management.get_torch_device(), offload_device=comfy.model_management.unet_offload_device())
-        model.load_state_dict(sd, assign=model_patcher.should_assign_weights())
+        assign = model_patcher.should_assign_weights()
+        normalize_model_patch_state_dict(model, sd, assign=assign, quantized=quantized)
+        model.load_state_dict(sd, assign=assign)
         return (model_patcher,)
 
 
